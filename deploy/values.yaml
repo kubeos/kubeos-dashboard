@@ -32,6 +32,12 @@ config:
   tlsCertPath: "/headlamp-cert/tls.crt"
   tlsKeyPath: "/headlamp-cert/tls.key"
 
+# With TLS on, the probes must speak TLS too. The chart defaults them to HTTP and
+# the server answers "client sent an HTTP request to an HTTPS server", so the pod
+# never becomes Ready and the deployment crash-loops.
+probes:
+  scheme: HTTPS
+
 # The plugin manager needs internet at runtime (npx @headlamp-k8s/pluginctl)
 # and replaces /headlamp/plugins with an emptyDir. Both are wrong for an
 # offline single-node box, and enabling it would hide the baked-in plugin.
@@ -43,3 +49,13 @@ service:
   port: 80
   # Reachable on every node IP, i.e. https://<node>:30443
   nodePort: 30443
+
+# Per-machine certificate, generated at first boot. Never shipped in the ISO.
+volumes:
+  - name: kubeos-cert
+    secret:
+      secretName: kubeos-dashboard-tls
+volumeMounts:
+  - name: kubeos-cert
+    mountPath: /headlamp-cert
+    readOnly: true
