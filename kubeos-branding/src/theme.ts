@@ -8,15 +8,15 @@
  * fields are ignored by the older runtime anyway, so nothing breaks by
  * staying inside the 0.14 surface.
  */
-import { registerAppTheme } from '@kinvolk/headlamp-plugin/lib';
-import { BRAND } from './brand';
+import { registerAppTheme } from "@kinvolk/headlamp-plugin/lib";
+import { BRAND } from "./brand";
 
 /** Whatever shape the installed plugin version expects -- no hard-coded copy of the type. */
 type RegisteredTheme = Parameters<typeof registerAppTheme>[0];
 
 export const kubeosTheme: RegisteredTheme = {
-  name: 'KubeOS',
-  base: 'dark',
+  name: "KubeOS",
+  base: "dark",
 
   primary: BRAND.lime.primary,
   secondary: BRAND.glow,
@@ -46,5 +46,5 @@ export const kubeosTheme: RegisteredTheme = {
   },
 
   radius: BRAND.radius,
-  buttonTextTransform: 'none',
+  buttonTextTransform: "none",
 };
