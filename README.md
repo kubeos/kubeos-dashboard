@@ -13,6 +13,12 @@ This repository holds only the KubeOS-specific layer:
 Nothing here modifies Headlamp itself. The upstream image, binary and frontend
 bundle are used exactly as published.
 
+## Branches
+
+`development` is the default branch and where all work lands. `main` is a release
+mirror kept identical to it; changes are fast-forwarded across, never committed to
+`main` directly. See `AGENTS.md`.
+
 ## Attribution
 
 Based on Headlamp, Copyright The Kubernetes Authors, Apache-2.0. Headlamp is a
@@ -61,8 +67,10 @@ Then open `https://<node-ip>:30443`.
   a frontend rebuild can change. The plugin rewrites the title through the DOM,
   so it reads KubeOS, but the About/version text still says Headlamp.
 - **Default theme**: `registerAppTheme` in plugin 0.14 has no "make it the
-  default" option, so the theme is selected once per browser in
-  *Settings → General → Themes*. Newer plugin releases add that option.
+  default" option, so the plugin seeds `headlampThemePreference` and reloads once
+  on a browser's very first visit. Until that reload the first paint is Light;
+  after it the KubeOS theme is the stored choice and a user can still pick Light
+  or Dark in *Settings → General → Themes*.
 - **Terminal colours**: the KubeOS console palette is an installer UI palette
   (index 7 is the panel background, index 0 is body text). It does not map onto
   ANSI semantics, where black must be dark; copying it verbatim would make
