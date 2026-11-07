@@ -91,6 +91,7 @@ function brandDocument() {
   }
 
   applyLinkColour();
+  applyChartColour();
 
   const icons = document.querySelectorAll<HTMLLinkElement>('link[rel~="icon"]');
   if (icons.length === 0) {
@@ -171,6 +172,37 @@ function applyLinkColour() {
   style.textContent = `
     .MuiLink-root { color: ${BRAND.lime.light} !important; }
     .MuiLink-root:hover { color: ${BRAND.lime.primary} !important; }
+  `;
+  document.head.appendChild(style);
+}
+
+/**
+ * The Overview gauges are recharts donuts whose "healthy" slice is painted with
+ * theme.palette.success.main -- MUI green[50], a pale mint unrelated to KubeOS.
+ * `success` is not a field of AppTheme, so registerAppTheme cannot reach it and
+ * the SVG fill attribute is the only lever a plugin has.
+ *
+ * Matching on the fill the app actually painted keeps the rule honest. The
+ * "not ready" (error) and "degraded" (warning) slices keep their own colours,
+ * so losing a pod still reads as red instead of turning lime. If a future
+ * Headlamp changes success.main, this selector stops matching and the gauges
+ * fall back to the stock mint: no breakage, and never a wrong colour.
+ */
+const CHART_OVERRIDE_ID = "kubeos-branding-charts";
+const HEADLAMP_SUCCESS_FILL = "#e8f5e9";
+
+function applyChartColour() {
+  if (document.getElementById(CHART_OVERRIDE_ID)) {
+    return;
+  }
+  const style = document.createElement("style");
+  style.id = CHART_OVERRIDE_ID;
+  // A presentation attribute loses to any stylesheet rule, so no !important is
+  // needed here -- unlike the link colour, which fights MUI's emotion styles.
+  style.textContent = `
+    .recharts-pie .recharts-sector[fill="${HEADLAMP_SUCCESS_FILL}" i] {
+      fill: ${BRAND.lime.primary};
+    }
   `;
   document.head.appendChild(style);
 }
