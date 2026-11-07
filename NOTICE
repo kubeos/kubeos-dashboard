@@ -1,0 +1,13 @@
+KubeOS Dashboard
+Copyright 2026 KubeOS contributors
+
+This product is based on Headlamp (https://github.com/kubernetes-sigs/headlamp),
+Copyright 2019-2025 The Kubernetes Authors, licensed under the Apache License 2.0.
+
+Headlamp is a CNCF sandbox project. KubeOS is not affiliated with, endorsed by, or
+sponsored by the Cloud Native Computing Foundation, the Kubernetes project, or the
+Headlamp maintainers. The name "KubeOS" and the KubeOS marks identify this
+distribution only.
+
+The unmodified Headlamp container image is used as the base of the image built from
+image/Dockerfile; the KubeOS theme and logo are supplied as a Headlamp plugin.

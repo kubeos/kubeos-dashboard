@@ -1,0 +1,10 @@
+# dependencies
+node_modules/
+
+# plugin build output is committed on purpose (see README): the Debian live-build
+# machine has no Node toolchain, so the image build must be able to consume a
+# ready-made bundle.
+
+# editor / OS noise
+.DS_Store
+*.swp

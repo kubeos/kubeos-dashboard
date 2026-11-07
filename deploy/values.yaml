@@ -1,0 +1,45 @@
+# Helm values for the upstream Headlamp chart, as used on a KubeOS node.
+#
+# Install with the chart version PINNED, because the chart default image tag is
+# derived from appVersion and a moving chart can silently change both:
+#   helm upgrade --install kubeos-dashboard headlamp \
+#     --repo https://headlamp-k8s.github.io/headlamp/ \
+#     --version 0.46.0 --namespace kubeos-system --create-namespace \
+#     -f values.yaml
+
+image:
+  registry: ghcr.io
+  repository: skmdab/headlamp
+  # Our own tag: upstream + the KubeOS branding plugin, nothing else.
+  tag: "kubeos-0.1.0"
+  pullPolicy: IfNotPresent
+
+config:
+  inCluster: true
+  inClusterContextName: "main"
+  baseURL: ""
+  sessionTTL: 86400
+
+  # Never enable this: it authenticates every visitor as the pod's service
+  # account. It is only safe behind a separate auth proxy, which we do not have.
+  unsafeUseServiceAccountToken: false
+
+  pluginsDir: "/headlamp/plugins"
+  watchPlugins: false
+
+  # TLS is terminated by Headlamp itself. The certificate is generated per
+  # machine at first boot and mounted from a Secret -- never shipped in the ISO.
+  tlsCertPath: "/headlamp-cert/tls.crt"
+  tlsKeyPath: "/headlamp-cert/tls.key"
+
+# The plugin manager needs internet at runtime (npx @headlamp-k8s/pluginctl)
+# and replaces /headlamp/plugins with an emptyDir. Both are wrong for an
+# offline single-node box, and enabling it would hide the baked-in plugin.
+pluginsManager:
+  enabled: false
+
+service:
+  type: NodePort
+  port: 80
+  # Reachable on every node IP, i.e. https://<node>:30443
+  nodePort: 30443

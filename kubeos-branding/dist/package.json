@@ -1,0 +1,32 @@
+{
+  "name": "kubeos-branding",
+  "version": "0.1.0",
+  "description": "KubeOS theme and logo for Headlamp.",
+  "license": "Apache-2.0",
+  "author": "KubeOS contributors",
+  "private": true,
+  "scripts": {
+    "build": "headlamp-plugin build",
+    "start": "headlamp-plugin start",
+    "tsc": "headlamp-plugin tsc",
+    "lint": "headlamp-plugin lint",
+    "format": "headlamp-plugin format",
+    "assets": "node ../scripts/embed-assets.mjs"
+  },
+  "keywords": [
+    "headlamp",
+    "headlamp-plugin",
+    "kubeos"
+  ],
+  "devDependencies": {
+    "@kinvolk/headlamp-plugin": "^0.14.0"
+  },
+  "overrides": {
+    "typescript": "5.6.2"
+  },
+  "headlamp": {
+    "extraDist": {
+      "package.json": "package.json"
+    }
+  }
+}
