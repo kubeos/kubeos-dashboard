@@ -16,4 +16,8 @@ ARG HEADLAMP_VERSION=v0.46.0
 FROM ghcr.io/headlamp-k8s/headlamp:${HEADLAMP_VERSION}
 
 # Prebuilt by `npm run build` in kubeos-branding/ (package.json + main.js).
-COPY kubeos-branding/dist/ /headlamp/plugins/kubeos-branding/
+#
+# --chmod=644 is not cosmetic: the server runs as the unprivileged `headlamp`
+# user, and a file that lands mode 600 is served as 403, which makes the
+# frontend reject the plugin silently.
+COPY --chmod=644 kubeos-branding/dist/ /headlamp/plugins/kubeos-branding/
