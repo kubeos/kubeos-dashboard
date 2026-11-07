@@ -31,7 +31,9 @@ export const kubeosTheme: RegisteredTheme = {
   },
 
   sidebar: {
-    background: BRAND.bg.base,
+    // Panel colour, not the page colour: with both at #050B05 the sidebar and
+    // the content area are separated by a hairline and the app looks flat.
+    background: BRAND.bg.panel,
     color: BRAND.text.body,
     // Selected row: solid lime with near-black text, the same inversion the
     // KubeOS installer uses for its highlighted rows.

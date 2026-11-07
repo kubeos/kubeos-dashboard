@@ -10,7 +10,7 @@ import {
   registerAppTheme,
 } from "@kinvolk/headlamp-plugin/lib";
 import { FAVICON, MARK, WORDMARK } from "./assets";
-import { PRODUCT_NAME } from "./brand";
+import { BRAND, PRODUCT_NAME } from "./brand";
 import { kubeosTheme } from "./theme";
 
 /**
@@ -90,6 +90,8 @@ function brandDocument() {
     });
   }
 
+  applyLinkColour();
+
   const icons = document.querySelectorAll<HTMLLinkElement>('link[rel~="icon"]');
   if (icons.length === 0) {
     const link = document.createElement("link");
@@ -149,6 +151,29 @@ function defaultToKubeOSTheme() {
 }
 
 defaultToKubeOSTheme();
+
+/**
+ * Headlamp hardcodes the link colour for dark themes (#6CB6F2) inside
+ * createMuiTheme, which overrides whatever AppTheme.link.color says -- so a
+ * KubeOS theme still renders pod names, namespaces and IPs in blue.
+ *
+ * A stylesheet rule is the only lever a plugin has here. !important is required
+ * because MUI injects its own emotion styles ahead of ours.
+ */
+const LINK_OVERRIDE_ID = "kubeos-branding-links";
+
+function applyLinkColour() {
+  if (document.getElementById(LINK_OVERRIDE_ID)) {
+    return;
+  }
+  const style = document.createElement("style");
+  style.id = LINK_OVERRIDE_ID;
+  style.textContent = `
+    .MuiLink-root { color: ${BRAND.lime.light} !important; }
+    .MuiLink-root:hover { color: ${BRAND.lime.primary} !important; }
+  `;
+  document.head.appendChild(style);
+}
 
 registerAppLogo(KubeOSLogo);
 registerAppTheme(kubeosTheme);
