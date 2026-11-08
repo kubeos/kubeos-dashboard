@@ -95,8 +95,10 @@ At the beginning of each session:
 
 1. Confirm the current branch on host and builder VM (should be `development`).
 2. Confirm host and builder VM repos are in sync.
-3. Check `CLI_REQUIREMENTS.md` for open items and remind me of them.
-4. Ask what I want to work on.
+3. Read `MEMORY.md` for the running record of decisions, machine facts and open
+   items, and keep it current as the session goes.
+4. Check `CLI_REQUIREMENTS.md` for open items and remind me of them.
+5. Ask what I want to work on.
 
 ## 11. Handing work to the KubeOS session
 
