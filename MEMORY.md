@@ -33,11 +33,26 @@ Helpful scripts and materials from earlier sessions live **outside the repo** in
 node), `.vm_key` (the SSH key authorized on both VMs), `admin.conf` (node kubeconfig),
 `token.txt`, screenshot tooling (`shoot-*.js`), and `.docker/` (a `DOCKER_CONFIG`).
 
-**SSH on this host is broken for normal use**: `/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf`
-is owned by `nobody:nogroup`, so every plain `ssh` **and `git fetch/push` over SSH**
-fails with `Bad owner or permissions`. Workaround in `vm.sh`/`node.sh`:
-`ssh -F /dev/null -i <key> -o StrictHostKeyChecking=no -o UserKnownHostsFile=<file>`.
-Fixing the ownership needs root, which this sandbox does not have.
+**The host's own SSH works.** `ssh -T git@github.com` authenticates as `skmdab` from a
+normal shell, and the VMs are reachable as usual.
+
+What fails is plain `ssh` **inside the agent sandbox**, and it is a sandbox artefact
+rather than a host problem: root-owned files are presented there as
+`nobody:nogroup` (`stat /etc/ssh/ssh_config` → `nobody:nogroup`), and `ssh` refuses a
+config owned by someone else with `Bad owner or permissions on
+/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf`. The file is genuinely root-owned on
+the host. Consequences and workarounds:
+
+- VMs: use `vm.sh` / `node.sh`, which pass `ssh -F /dev/null -i <key> -o
+  StrictHostKeyChecking=no -o UserKnownHostsFile=<file>` and skip the system config.
+- GitHub from the agent: `GIT_SSH_COMMAND="ssh -F /dev/null -o
+  StrictHostKeyChecking=accept-new" git fetch origin development`, then leave `git pull`
+  alone (it re-fetches) and fast-forward with `git merge --ff-only origin/development`.
+- Pushing: the builder VM has working git + GitHub SSH, so commits are pushed from
+  there; the host then fast-forwards as above. The maintainer can also push from the
+  host shell himself.
+- Do not "fix" the file ownership from this session: it is correct already, and the
+  error only appears under the sandbox.
 
 ## 3. Repo and branch state
 
