@@ -85,7 +85,11 @@ Things to watch for: required pods or controllers (metrics-server, ingress, stor
 - Do not make large changes (restructuring, dependency upgrades, mass renames) without telling me the plan first.
 - If my request is unclear, ask before building.
 
-## 9. Session start checklist
+## 9. Memory
+
+- Save everything to your memory.
+
+## 10. Session start checklist
 
 At the beginning of each session:
 
