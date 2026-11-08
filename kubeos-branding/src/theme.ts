@@ -38,7 +38,14 @@ export const kubeosTheme: RegisteredTheme = {
     // Selected row: solid lime with near-black text, the same inversion the
     // KubeOS installer uses for its highlighted rows.
     selectedBackground: BRAND.lime.primary,
-    selectedColor: BRAND.bg.base,
+    // NOT the colour to put on the lime row -- that text comes from
+    // getContrastText(selectedBackground) and is already near black. Headlamp
+    // uses selectedColor only for a *nested* selected row (e.g. Nodes under
+    // Clusters), where it paints both the label and a 4px marker bar on the
+    // sidebar background and no fill at all. Parked on the panel colour, the
+    // label measured 1.06:1 against that background and vanished, which is
+    // exactly what a submenu selection must never do.
+    selectedColor: BRAND.lime.primary,
     actionBackground: BRAND.bg.panel,
   },
 
