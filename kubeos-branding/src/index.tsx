@@ -185,11 +185,19 @@ function applyLinkColour() {
  * Matching on the fill the app actually painted keeps the rule honest. The
  * "not ready" (error) and "degraded" (warning) slices keep their own colours,
  * so losing a pod still reads as red instead of turning lime. If a future
- * Headlamp changes success.main, this selector stops matching and the gauges
- * fall back to the stock mint: no breakage, and never a wrong colour.
+ * Headlamp changes these fills, the selector stops matching and the gauges fall
+ * back to Headlamp's own colours: no breakage, and never a wrong colour.
  */
 const CHART_OVERRIDE_ID = "kubeos-branding-charts";
-const HEADLAMP_SUCCESS_FILL = "#e8f5e9";
+
+/**
+ * The only two fills Headlamp uses for "the thing being measured":
+ * `success.main` on the Ready/Not Ready rings and `chartStyles.fillColor` on the
+ * CPU and memory usage rings. Everything semantic is deliberately absent -- error
+ * red, warning amber, the grey-ish "total" slice
+ * (rgba(20, 20, 20, 0.1)) that is invisible on a dark background anyway.
+ */
+const HEADLAMP_MEASURE_FILLS = ["#e8f5e9", "#929191"];
 
 function applyChartColour() {
   if (document.getElementById(CHART_OVERRIDE_ID)) {
@@ -199,11 +207,10 @@ function applyChartColour() {
   style.id = CHART_OVERRIDE_ID;
   // A presentation attribute loses to any stylesheet rule, so no !important is
   // needed here -- unlike the link colour, which fights MUI's emotion styles.
-  style.textContent = `
-    .recharts-pie .recharts-sector[fill="${HEADLAMP_SUCCESS_FILL}" i] {
-      fill: ${BRAND.lime.primary};
-    }
-  `;
+  style.textContent = HEADLAMP_MEASURE_FILLS.map(
+    (fill) =>
+      `.recharts-pie .recharts-sector[fill="${fill}" i] { fill: ${BRAND.lime.primary}; }`
+  ).join("\n");
   document.head.appendChild(style);
 }
 
