@@ -97,3 +97,26 @@ At the beginning of each session:
 2. Confirm host and builder VM repos are in sync.
 3. Check `CLI_REQUIREMENTS.md` for open items and remind me of them.
 4. Ask what I want to work on.
+
+## 11. Handing work to the KubeOS session
+
+Anything the dashboard needs that only the KubeOS side can provide -- a component to
+deploy, RBAC, a port, a namespace, a package, a config file -- is handed over as a
+prompt the maintainer pastes into the KubeOS workspace. Always the same shape:
+
+1. One line: "Handoff from the dashboard project: <what must exist>. Nothing in this
+   tree needs dashboard code -- this is <layer> work only."
+2. **Problem** -- the symptom in observable terms (`kubectl top` error, a 404, an
+   empty list), never "please install X".
+3. **What must be true on a freshly installed node** -- numbered outcomes: offline
+   image availability, where it must run, the flags that are easy to get wrong, the
+   verification commands with expected output, and what must NOT block first boot if
+   it fails.
+4. **Reference manifest** -- absolute path in this repo to any prepared file, with
+   "copy it into the tree rather than referencing it from there".
+5. **Constraints** -- what must not be touched (Calico, kubelet, containerd) and what
+   is out of scope (the dashboard itself).
+
+Write outcomes and constraints, not file names or code: the KubeOS session knows its
+own repository. Never edit the KubeOS tree from here, and never rewrite its rules or
+requirement lists.
