@@ -88,6 +88,14 @@ Things to watch for: required pods or controllers (metrics-server, ingress, stor
 ## 9. Memory
 
 - Save everything to your memory.
+- That memory is **`MEMORY.md`** in this repo, and it is written **during** the
+  session, not at the end of it: after every change, deployment, decision, discovery
+  or mistake, update it in the same turn, then carry on. A session can die mid-answer
+  (it has), and a fact that lives only in the chat transcript dies with it.
+- Keep these current as you go: the session history, the open-items list, the live
+  state of the dashboard, and any new machine fact or gotcha.
+- Never put secrets in it: no tokens, no private keys. Record the command that
+  fetches the secret, and where the file lives outside the repo.
 
 ## 10. Session start checklist
 

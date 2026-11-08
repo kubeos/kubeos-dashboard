@@ -3,11 +3,33 @@
 Written to be read at the start of a session, after `AGENTS.md`. It is the durable
 record of decisions, machine facts and history so no session has to rediscover them.
 
-Last updated: 2026-11-08, from the transcript of session
-`session-956734de-8e0e-4798-8bee-5f8bcf2eabd5` (42 turns, 469 steps), plus a fresh
-verification pass against both machines on the same day.
+Last updated: 2026-11-08 (session B, this one). Started from the transcript of session
+`session-956734de-8e0e-4798-8bee-5f8bcf2eabd5` (42 turns, 469 steps) and has been
+kept current by hand ever since.
 
 No secrets here by design: no tokens, no private keys. See §10 for where those live.
+
+---
+
+## How this file stays current
+
+`AGENTS.md` §9 makes this the project's memory and §10.3 makes reading it the third
+step of every session. The rule that matters: **it is written during the session, not
+at the end.** After every change, deploy, decision, discovery or mistake, append it in
+the same turn and carry on — session `956734de` died with an unanswered question
+because its context only ever existed in the chat log.
+
+What to touch, most-often first:
+
+- **§5 Session history** — one bullet per event, appended under the session that did it.
+  Plain language, what changed and why; no need to restate code that is in the repo.
+- **§7 Open items** — add, re-scope or remove the moment the state changes.
+- **§6 Live state** — after each deploy, say what was verified and how.
+- **§2, §4, §8, §9** — when a new machine fact, command, internals detail or trap is
+  learned the hard way.
+- **Version trio** (§3) — when Headlamp, the chart or the plugin SDK moves.
+
+Keep it factual and keep it honest: if something was not tested, say "not verified".
 
 ---
 
@@ -95,7 +117,12 @@ docker run --rm --network host -v "$PWD":/shots -v /etc/hosts:/etc/hosts:ro \
 Live dashboard: **https://192.168.122.4:30443** (NodePort, self-signed cert →
 browser warning expected). No login prompt (see §6).
 
-## 5. Chronological history of the previous session
+## 5. Session history (append-only)
+
+Newest session last. Each session appends its own block rather than rewriting earlier
+ones — the old reasoning is often worth more than a tidy summary of it.
+
+### Session A — `956734de`, 2026-11-08 01:27 → 13:12 (killed mid-answer)
 
 1. **Surveys and decisions.** The maintainer picked Headlamp over the archived
    `kubernetes/dashboard`; separate private repo; delivery path **B — own image**, but
@@ -159,6 +186,33 @@ browser warning expected). No login prompt (see §6).
     was the only such bug.
 15. **Session ended unanswered.** The last question was **"why storage section does not
     showing any data"** — never answered. See §7.
+
+### Session B — this one, 2026-11-08 13:24 → (cwd `~/kubeos-dashboard`)
+
+1. **Recovery of session A.** Read `AGENTS.md`, the whole repo, then decompressed and
+   parsed A's transcript (1.8 MB zstd → 3397 events) and distilled it into this file.
+   Verified the environment independently: both repos on `development` @ `ef5bc81`,
+   clean and identical; node Ready; dashboard 200; metrics Available True.
+2. **`MEMORY.md` created** (`b20b03b`) and `AGENTS.md` §10 gained the step that reads it.
+3. **SSH misdiagnosis corrected** (`218841a`). Session B first reported "the host's SSH
+   is broken"; the maintainer's own `ssh -T git@github.com` worked. The real cause is
+   the sandbox mapping root-owned files to `nobody`, so only the agent is affected.
+   Recorded, together with the `-F /dev/null` fetch + `--ff-only` merge recipe.
+4. **Storage question answered** (`2dd3fe2`). Zero StorageClasses, PVs, PVCs and CSI
+   drivers; the dashboard SA gets `200 {"items":[]}`, so the empty pages are honest. A
+   throwaway PVC (`kubeos-storage-test/cli-check`) stayed `Pending` with
+   `FailedBinding: no persistent volumes available for this claim and no storage class
+   is set`, proving there is no provisioner. Cleaned up afterwards; nothing installed.
+   Logged as CLI requirement 4 and handed over in the §11 format.
+5. **Memory made automatic.** On the maintainer's instruction, `AGENTS.md` §9 now says
+   this file is written *during* a session, and this file says how (§"How this file
+   stays current"). From here on, every session appends under its own heading.
+
+### Next session — start here
+
+Copy this block when beginning: confirm branch + sync on both machines, read §7 open
+items, then ask. The most likely next piece of work is the auth scoping (open item 2)
+or whatever the maintainer reports after clicking around.
 
 ## 6. Current live state (verified 2026-11-08 by this session)
 

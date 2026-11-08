@@ -8,3 +8,7 @@ node_modules/
 # editor / OS noise
 .DS_Store
 *.swp
+
+# screenshots taken to verify a change against the live cluster; evidence for a
+# conversation, not part of the product
+.shots/
