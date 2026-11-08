@@ -1,80 +1,95 @@
-# AGENTS.md -- KubeOS Dashboard
+# Rules for DeepSeek: kubeos-dashboard
 
-Guidance for anyone, human or agent, changing this repository.
+Read this file at the start of every session and follow it for the whole session.
+If a rule here conflicts with what you were about to do, the rule wins. If you are unsure, ask me.
 
-## Branches
+## 1. Project overview
 
-- **`development` is the default branch, and the only branch to push to.** All work
-  happens here, `origin/HEAD` points at it, and `git push` goes here. Never push to
-  `main` on your own initiative.
-- **`main` is a release mirror, updated only on request.** Push to it only when the
-  maintainer explicitly asks for it in the current conversation. Until then `main`
-  is expected to sit behind `development`, and closing that gap is not your job:
+- **kubeos-dashboard** is the web dashboard for **KubeOS**, built on top of **Headlamp** (the Headlamp repo is cloned on the host).
+- The dashboard is used to manage a real KubeOS system, so features must work against a real cluster, not mocks.
+- The **KubeOS CLI** (separate project, about 90% complete) installs and configures the KubeOS system. The dashboard depends on what the CLI deploys.
 
-  ```sh
-  git checkout main && git merge --ff-only development && git push origin main
-  git checkout development
-  ```
+## 2. Infrastructure (already set up)
 
-## This repo is small on purpose
+- **Builder VM** (KVM): development and build environment. You have SSH access.
+- **KubeOS VM** (KVM): a real KubeOS system installed for testing. You have SSH access.
+- **Host**: you may create and manage docker pods/containers here to deploy the dashboard for testing. I open it in the browser and tell you what to add or change based on how it looks.
+- Permissions already given: SSH to both VMs, docker pods on the host. Do not exceed these (see section 5).
 
-| Path | What it is |
-|---|---|
-| `kubeos-branding/` | Headlamp plugin: theme, logo, title, favicon |
-| `image/Dockerfile` | one layer on the official Headlamp image |
-| `deploy/values.yaml` | Helm values: NodePort 30443, TLS, plugin manager off |
+## 3. Git rules (IMPORTANT)
 
-Nothing here patches Headlamp. The upstream image, binary and frontend bundle are
-used exactly as published, so an upstream security release is an `ARG` bump rather
-than a merge. Do not add a Headlamp fork, a fork of `dist/`, or a vendored copy.
+1. **Never commit or push without asking me first.** This applies to every change, including small ones. Do not auto-commit or auto-push.
+2. Before asking, show me:
+   - which repo/machine (host, builder VM)
+   - which files changed
+   - a short summary of the changes
+   - the proposed commit message
+3. Wait for my explicit approval ("yes", "commit", "push") for each commit and push.
+4. **Default branch is `development`.** Push only to `development`.
+5. **Never push to `main`** unless I clearly say so in that message (for example "push to main"). Earlier permission does not carry over. Ask again each time.
+6. Never force-push, rewrite history, delete branches, or change remotes without asking.
+7. Group small changes together. Do not propose a commit for every tiny edit. Ask when a logical piece of work is finished or when I tell you to.
 
-## Two things that are easy to break
+## 4. Keep local copies in sync
 
-- **`kubeos-branding/dist/` is committed.** The ISO build machine has no Node
-  toolchain. Change `src/`, rebuild, commit both. A `dist/` that does not match
-  `src/` is a bug.
-- **The plugin files must be world-readable.** `headlamp-server` runs as an
-  unprivileged user; a `dist/package.json` at mode 600 is served as 403 and the
-  frontend silently drops the plugin. The Dockerfile uses `COPY --chmod=644`, so
-  never remove it.
+- The repo exists on the **host** and on the **builder VM**. Keep both in sync with every change.
+- After editing in one place, make sure the other has the same state (copy, pull or rsync as appropriate). Tell me if they ever diverge.
+- Syncing locally is allowed without asking. Pushing to GitHub is not (section 3).
 
-## Authentication is not solved yet
+## 5. Boundaries
 
-The dashboard runs with `unsafeUseServiceAccountToken: true`, so it authenticates
-as its own service account (`kubeos-dashboard-headlamp`) and asks for nothing.
-That binding is currently `cluster-admin`, created by hand, which means anyone who
-reaches port 30443 has full cluster access. Scoping it to a read-mostly role is
-the open work item; do not describe the dashboard as authenticated until it is
-done, and do not widen the exposure in the meantime.
+- Stay within the dashboard work. Do not modify the KubeOS system VM's configuration beyond what is needed to test the dashboard, and tell me what you changed there.
+- Do not touch the KubeOS CLI code from this session. The CLI is changed in a separate KubeOS workspace session (section 6).
+- Do not delete VMs, volumes, images, or data outside the dashboard's test containers without asking.
+- Do not expose services outside the local machine and VMs.
+- Do not store secrets, tokens, or SSH keys in the repo.
 
-## Usage answers come from metrics-server
+## 6. Dashboard needs a CLI change: report it, do not guess
 
-The CPU/memory cards read `metrics.k8s.io`. If those two cards show a bare number
-("2 units", "1.93 GB") with no ring, the metrics API is missing -- that is
-`deploy/metrics-server/`, not a plugin or theme problem. Do not "fix" it in CSS.
+While developing and testing the dashboard, you will often find that a feature needs something the KubeOS CLI does not install or configure yet.
 
-## Versions move together
+**Example:** the CLI did not deploy metrics-server, so the dashboard showed "metrics server not found" for CPU and RAM.
 
-Headlamp image `v0.46.0`, Helm chart `0.46.0`, `@kinvolk/headlamp-plugin ^0.14.0`.
-Bump all three in one commit, then confirm the theme still applies.
+When this happens:
 
-## Branding rules
+1. **Stop and tell me.** Do not work around it silently, and do not hack the cluster by hand and move on, unless I tell you to do it temporarily for testing.
+2. Add the item to the running list in `CLI_REQUIREMENTS.md` at the repo root (create it if missing), and also tell me in chat.
+3. For each item, write it so I can paste it into a KubeOS CLI session without extra context:
 
-- Colours and the logo come from the KubeOS platform tree (`kubeos-branding/src/brand.ts`
-  records provenance per value). Do not invent, "improve" or recolour the logo, and
-  do not add brand values that the platform does not define; mark derived values as
-  derived, as `brand.ts` already does for `bg.muted` and `radius`.
-- Accent lime is `#A3F000`, light lime `#DBFF7A`; page `#050B05`, panel `#0B140B`,
-  body text `#E8F2DC`.
-- Keep `LICENSE` and `NOTICE`. Never imply CNCF, Kubernetes or Headlamp-maintainer
-  endorsement: KubeOS is not affiliated with them.
-- Status semantics outrank brand colour: healthy things may be lime, but warnings
-  stay amber and errors stay red. Overrides therefore key on the exact fill
-  Headlamp painted (see `applyChartColour`), not on "the first slice".
+```
+### <short title>
+- Dashboard feature affected: <page / feature>
+- Symptom seen: <exact error or behavior>
+- What the CLI must add or change: <package, pod, manifest, namespace, flag, RBAC, service, config...>
+- Where it should run: <e.g. kube-system, at install time, post-install step>
+- How to verify it works: <command to run on the KubeOS VM and expected output>
+- Temporary workaround used for testing (if any): <what you did by hand, so I can confirm it matches the final CLI behavior>
+```
 
-## Verifying a change
+4. If you did a manual workaround on the KubeOS VM for testing, list the exact commands and manifests you used. The CLI must reproduce them.
+5. Keep this list current. At the end of a session, give me a summary of all open CLI requirements.
 
-Rebuild the plugin (`npx headlamp-plugin build && npx headlamp-plugin tsc`), rebuild
-the image, import it into the node's containerd (`imagePullPolicy: Never`, there is
-no registry), then look at the real thing at `https://<node-ip>:30443`. Screenshots
-or it did not happen.
+Things to watch for: required pods or controllers (metrics-server, ingress, storage), RBAC and service accounts, ports and services, namespaces, config files, package or image dependencies, and anything the dashboard expects to exist after a fresh KubeOS install.
+
+## 7. Testing workflow
+
+- Deploy the dashboard in docker on the host and tell me the URL to open.
+- After a change, tell me what to look at in the browser and what you expect to see.
+- Test against the real KubeOS VM, not fake data, whenever possible.
+- When something fails, report the real error, what you checked, and your suspected cause. Do not claim it works unless you tested it.
+
+## 8. Communication style
+
+- Be concise and clear. I may not know every technical detail, so explain briefly what you did and why.
+- Ask one clear question at a time when you need a decision.
+- Do not make large changes (restructuring, dependency upgrades, mass renames) without telling me the plan first.
+- If my request is unclear, ask before building.
+
+## 9. Session start checklist
+
+At the beginning of each session:
+
+1. Confirm the current branch on host and builder VM (should be `development`).
+2. Confirm host and builder VM repos are in sync.
+3. Check `CLI_REQUIREMENTS.md` for open items and remind me of them.
+4. Ask what I want to work on.
