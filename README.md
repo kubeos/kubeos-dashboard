@@ -15,9 +15,10 @@ bundle are used exactly as published.
 
 ## Branches
 
-`development` is the default branch and where all work lands. `main` is a release
-mirror kept identical to it; changes are fast-forwarded across, never committed to
-`main` directly. See `AGENTS.md`.
+`development` is the default branch and the only branch that receives work. `main`
+is a release mirror, updated only when its maintainer asks for it by fast-forwarding
+it to `development`. Nothing is committed to `main` directly and nothing is pushed to
+it automatically. See `AGENTS.md`.
 
 ## Attribution
 

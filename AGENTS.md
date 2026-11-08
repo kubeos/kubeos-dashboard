@@ -4,11 +4,12 @@ Guidance for anyone, human or agent, changing this repository.
 
 ## Branches
 
-- **`development` is the default branch.** All work happens here, and `origin/HEAD`
-  points at it.
-- **`main` is a release mirror.** It is fast-forwarded from `development` and must
-  always hold the same code. Never commit to `main` directly, and never let the two
-  diverge:
+- **`development` is the default branch, and the only branch to push to.** All work
+  happens here, `origin/HEAD` points at it, and `git push` goes here. Never push to
+  `main` on your own initiative.
+- **`main` is a release mirror, updated only on request.** Push to it only when the
+  maintainer explicitly asks for it in the current conversation. Until then `main`
+  is expected to sit behind `development`, and closing that gap is not your job:
 
   ```sh
   git checkout main && git merge --ff-only development && git push origin main
