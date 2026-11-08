@@ -61,6 +61,17 @@ helm upgrade --install kubeos-dashboard headlamp \
 
 Then open `https://<node-ip>:30443`.
 
+## Cluster usage metrics
+
+The CPU and memory cards need the `metrics.k8s.io` API, which Kubernetes does not
+provide by itself. Without a metrics server they quietly show capacity instead of
+usage. See `deploy/metrics-server/` for the pinned metrics-server, why it needs
+`--kubelet-insecure-tls` on KubeOS, and how to side-load the image offline:
+
+```sh
+kubectl apply -f deploy/metrics-server/components.yaml
+```
+
 ## Authentication
 
 `config.unsafeUseServiceAccountToken: true` in `deploy/values.yaml` makes

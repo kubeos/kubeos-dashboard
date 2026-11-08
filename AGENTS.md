@@ -46,6 +46,12 @@ reaches port 30443 has full cluster access. Scoping it to a read-mostly role is
 the open work item; do not describe the dashboard as authenticated until it is
 done, and do not widen the exposure in the meantime.
 
+## Usage answers come from metrics-server
+
+The CPU/memory cards read `metrics.k8s.io`. If those two cards show a bare number
+("2 units", "1.93 GB") with no ring, the metrics API is missing -- that is
+`deploy/metrics-server/`, not a plugin or theme problem. Do not "fix" it in CSS.
+
 ## Versions move together
 
 Headlamp image `v0.46.0`, Helm chart `0.46.0`, `@kinvolk/headlamp-plugin ^0.14.0`.
