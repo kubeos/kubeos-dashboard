@@ -60,6 +60,11 @@ KubeOS install does none of it.
 - **Temporary workaround used for testing (if any):** yes, by hand:
   `kubectl create clusterrolebinding kubeos-dashboard-headlamp-admin --clusterrole=cluster-admin --serviceaccount=kubeos-system:kubeos-dashboard-headlamp`
 
+### The dashboard install itself is not automated (now also blocks joining nodes)
+
+> **Added 2026-11-08:** the new join flow depends on this. A node can only *paste* a control-plane
+> token if it runs its own dashboard, and a fresh KubeOS install has none — so "every dashboard has
+> Generate token / Join node" is only true once the CLI installs the dashboard on every node.
 ### The dashboard install itself is not automated
 - **Dashboard feature affected:** getting the dashboard onto a freshly installed
   KubeOS at all.
@@ -117,3 +122,100 @@ KubeOS install does none of it.
   (`cli-check`), used to observe `FailedBinding` and to confirm the dashboard renders a
   PVC correctly; both were deleted afterwards
   (`kubectl delete namespace kubeos-storage-test`). Nothing is left on the node.
+
+### multi-node: every KubeOS install becomes its own one-node cluster
+- **Dashboard feature affected:** there is no "add node" anywhere in the dashboard --
+  the Nodes page lists the one node and offers only cordon, drain, delete and edit.
+  Expectation from the maintainer: add a node the way Proxmox adds one.
+- **Symptom seen:** a second machine installed from the KubeOS ISO does not appear in
+  the dashboard's Nodes list. It ends up as its own independent cluster instead: first
+  boot runs `kubeos-cluster-init` (kubeadm init, marker `/var/lib/kubeos/initialized`),
+  never `kubeadm join`. **Verified 2026-11-08** on a second fresh install
+  (`192.168.122.5`, hostname `kubeos2`): `kubectl get nodes` *on that machine* showed it
+  as `kubeos2  Ready  control-plane`, while the original cluster still had one node. No
+  `kubeos` CLI binary exists in `PATH` on either node.
+- **What the CLI must add or change:** a supported join path for an additional machine:
+  either a command (`kubeos join <ip>:6443 --token ...`) or first-boot logic that detects
+  "join an existing cluster" (answer file / kernel keyword) and runs `kubeadm join`
+  instead of `kubeos-cluster-init`. The manual recipe below worked first try, so this is
+  packaging, not new capability. It also needs the bootstrap-token story (create/rotate/
+  print, ideally short-lived) and must not touch the existing node's CNI.
+- **Where it should run:** at install/first boot of the *additional* node; no change to
+  the first node's first boot.
+- **How to verify it works:** `kubectl get nodes` shows two rows, both `Ready`;
+  `kubectl -n kube-system get pods -o wide` shows a `calico-node` and a `kube-proxy` per
+  node; pod-to-pod traffic works across nodes; the dashboard's Nodes page lists both.
+  **All of this was verified after the manual join** — see the workaround below.
+- **Temporary workaround used for testing (if any):** yes, done by hand on the second
+  VM and it worked. Exact steps, which the CLI should reproduce:
+  1. On the second machine, discard the cluster it made for itself:
+     `kubeadm reset -f --cri-socket unix:///run/containerd/containerd.sock`;
+     `rm -rf /etc/kubernetes /var/lib/etcd /etc/cni/net.d /var/lib/kubelet/*
+     /var/lib/kubeos/initialized`;
+     `systemctl disable --now kubelet kubeos-cluster-setup.service`;
+     `hostnamectl set-hostname kubeos2`.
+  2. On the control plane: `kubeadm token create --print-join-command --ttl 1h`.
+  3. On the second machine: run that command with
+     `--cri-socket unix:///run/containerd/containerd.sock`.
+  No internet was needed: the worker's images (`kube-proxy`, `pause`, `calico/node`)
+  were already in its containerd from the ISO install. Results measured afterwards:
+  both nodes `Ready`, `calico-node` + `kube-proxy` on each, a TCP payload sent from a pod
+  on `kubeos` arrived in a pod on `kubeos2`, cluster DNS resolved, a 2-replica Deployment
+  placed one pod per node, and the dashboard showed both nodes with live CPU/memory.
+  Note the second machine must **skip** `kubeos-cluster-init`, or it forges a second
+  cluster (it also gets its own etcd and apiserver, i.e. unnecessary on a worker).
+
+### join-helper image and Job permissions: the "Join node" page cannot work on a fresh install
+- **Dashboard feature affected:** the new **Join node** page (adds machines to the cluster from
+  the dashboard, one form submission per node).
+- **Symptom seen:** on an offline node the join Job stays in `ImagePullBackOff` because
+  `ghcr.io/skmdab/kubeos-join-helper:0.1.0` is not in the node's containerd, exactly like the
+  dashboard image itself.
+- **What the CLI must add or change:**
+  1. bake `ghcr.io/skmdab/kubeos-join-helper:0.1.0` into the ISO image set (it is ~10 MB: alpine +
+     openssh-client + sshpass) so any node can run the Job;
+  2. make sure the image a *workload* needs exists on **every** node, not only the first — a
+     dashboard pod rescheduled onto the second node failed with `ImagePullBackOff` until it was
+     side-loaded there too. Same for the dashboard image.
+- **Where it should run:** image baking in the build hook that already pulls the platform images;
+  no runtime component.
+- **How to verify it works:** on a freshly installed, offline node:
+  `crictl images | grep -E 'kubeos-join-helper|headlamp'` lists both; then in the dashboard, Join
+  node → enter a second machine's address + root password → the attempt reaches `succeeded` and
+  the node appears in the Nodes list as `Ready`.
+- **Temporary workaround used for testing (if any):** the helper image was built on the host and
+  side-loaded into **both** nodes with
+  `docker save ghcr.io/skmdab/kubeos-join-helper:0.1.0 | gzip -1 | ssh root@<node> 'ctr -n k8s.io images import -'`.
+
+### storage: the provisioner runs, but no claim can ever bind
+- **Dashboard feature affected:** Storage -- Persistent Volume Claims, Persistent Volumes,
+  Storage Classes; and every stateful workload behind them.
+- **Symptom seen (fresh install, 2026-11-08 18:05, node `192.168.122.4`):** `kubectl get sc`
+  shows `local-path (default)`, the provisioner pod is `1/1 Running`, and yet every claim
+  stays `Pending`. First boot logged
+  `kubeos-cluster-ready: WARNING: the test claim did not reach Bound after 120s`, and the
+  provisioner log says exactly why:
+  `failed to provision volume with StorageClass "local-path": configuration error, no node was specified`.
+  So the dashboard's Storage pages will stay empty on every fresh install.
+- **What the CLI must add or change:** the shipped `local-path-storage.yaml` sets
+  `volumeBindingMode: Immediate`. That cannot work: local-path is node-local, so the
+  provisioner must be told which node the volume goes on, and only `WaitForFirstConsumer`
+  supplies it (the scheduler writes `pv.kubernetes.io/selected-node` onto the claim before
+  the provisioner runs). Two changes:
+  1. `volumeBindingMode: WaitForFirstConsumer` in the StorageClass (upstream's own value).
+     Note the field is **immutable**: an existing cluster needs the class deleted and
+     re-applied (a fresh install is unaffected).
+  2. first boot's step 7 self-test must consume the test claim with a small pod (the baked
+     `busybox` is already there) and wait for `Bound` before deleting both. A claim with no
+     consumer staying `Pending` is correct Kubernetes behaviour, so the current test can only
+     ever warn.
+- **Where it should run:** first boot, step 7 of `kubeos-cluster-ready`, after the CNI, a
+  Ready untainted node and the kube-system wait.
+- **How to verify it works:** `kubectl get sc` shows `local-path (default)` with
+  `WaitForFirstConsumer`; apply a 1Gi PVC with no `storageClassName` plus a pod that mounts
+  it -> `kubectl get pvc` reports `Bound`, `kubectl get pv` shows the `pvc-...` volume;
+  `journalctl -u kubeos-cluster-setup -b | grep -i storage` shows no `WARNING:`.
+- **Temporary workaround used for testing (if any):** yes, on the KubeOS VM only: deleted the
+  class and re-applied the same manifest with `volumeBindingMode: WaitForFirstConsumer`, then
+  a 1Gi no-class claim bound in ~20 s with a `busybox:1.38.0` consumer pod. The installed
+  manifest file was not edited, and the test pod/claim/PV were deleted afterwards.

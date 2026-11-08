@@ -11,6 +11,9 @@ import {
 } from "@kinvolk/headlamp-plugin/lib";
 import { FAVICON, MARK, WORDMARK } from "./assets";
 import { BRAND, PRODUCT_NAME } from "./brand";
+// The "Add node" page: join further machines to this cluster from the dashboard.
+// Imported for its side effect -- it registers its own route and sidebar entry.
+import "./addnode";
 import { kubeosTheme } from "./theme";
 
 /**
