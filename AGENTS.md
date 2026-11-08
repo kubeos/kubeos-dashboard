@@ -37,6 +37,15 @@ than a merge. Do not add a Headlamp fork, a fork of `dist/`, or a vendored copy.
   frontend silently drops the plugin. The Dockerfile uses `COPY --chmod=644`, so
   never remove it.
 
+## Authentication is not solved yet
+
+The dashboard runs with `unsafeUseServiceAccountToken: true`, so it authenticates
+as its own service account (`kubeos-dashboard-headlamp`) and asks for nothing.
+That binding is currently `cluster-admin`, created by hand, which means anyone who
+reaches port 30443 has full cluster access. Scoping it to a read-mostly role is
+the open work item; do not describe the dashboard as authenticated until it is
+done, and do not widen the exposure in the meantime.
+
 ## Versions move together
 
 Headlamp image `v0.46.0`, Helm chart `0.46.0`, `@kinvolk/headlamp-plugin ^0.14.0`.

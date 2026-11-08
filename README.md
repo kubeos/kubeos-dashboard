@@ -61,6 +61,27 @@ helm upgrade --install kubeos-dashboard headlamp \
 
 Then open `https://<node-ip>:30443`.
 
+## Authentication
+
+`config.unsafeUseServiceAccountToken: true` in `deploy/values.yaml` makes
+`headlamp-server` talk to the API as its own service account, so the dashboard
+opens without a login prompt.
+
+The service account name is the pod's, not a guess: the chart names it after the
+release, `kubeos-dashboard-headlamp`. It needs a binding or the UI loads normally
+and every list is empty behind 403s:
+
+```sh
+kubectl create clusterrolebinding kubeos-dashboard-headlamp-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=kubeos-system:kubeos-dashboard-headlamp
+```
+
+**`cluster-admin` is a development shortcut.** Before this goes into an ISO the
+binding must become a scoped `Role`/`ClusterRole` -- read on the KubeOS namespaces
+plus logs and events is what a dashboard actually needs -- because whatever it is
+granted, everyone who can reach port 30443 gets without authenticating.
+
 ## Known limits
 
 - **Page title**: Headlamp computes it from a build-time product name, which only

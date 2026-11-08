@@ -20,9 +20,17 @@ config:
   baseURL: ""
   sessionTTL: 86400
 
-  # Never enable this: it authenticates every visitor as the pod's service
-  # account. It is only safe behind a separate auth proxy, which we do not have.
-  unsafeUseServiceAccountToken: false
+  # The server authenticates to the API with its own service account token, so
+  # opening the dashboard asks for nothing. Pasting a token by hand was worse in
+  # practice: the session lives in the browser, and every new browser or cleared
+  # profile meant finding the 944-character JWT again.
+  #
+  # Two consequences that are not optional:
+  #   * the pod's service account needs a binding (see "Authentication" in
+  #     README.md). Without one the UI loads and every list is empty behind 403s.
+  #   * anyone who can reach the NodePort *is* that service account. Keep 30443 on
+  #     the management network and scope the binding down before this ships.
+  unsafeUseServiceAccountToken: true
 
   pluginsDir: "/headlamp/plugins"
   watchPlugins: false
