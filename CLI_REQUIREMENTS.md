@@ -84,3 +84,36 @@ KubeOS install does none of it.
   keypair generated with openssl and `kubectl apply`-ed as a
   `kubernetes.io/tls` secret; image side-loaded with `docker save | ctr import`;
   chart applied with `helm upgrade --install ... --version 0.46.0 -f deploy/values.yaml`.
+
+### storage: there is no StorageClass or provisioner, so every Storage page is empty
+- **Dashboard feature affected:** Storage -- Persistent Volume Claims, Persistent
+  Volumes, Storage Classes and Volume Attributes Classes. Beyond the dashboard, a
+  stateful workload (database, registry, anything with a PVC) cannot run at all.
+- **Symptom seen:** all four pages read "No data to be shown." That is honest, not a
+  permissions or UI bug: `kubectl get pvc,pv,sc -A` answers "No resources found",
+  `kubectl get csidrivers` is empty, and the dashboard's own service account gets
+  HTTP 200 with `items: []` from `/api/v1/persistentvolumeclaims`,
+  `/api/v1/persistentvolumes` and `/apis/storage.k8s.io/v1/storageclasses`. When a
+  test PVC was created, it stayed `Pending` with
+  `FailedBinding: no persistent volumes available for this claim and no storage class
+  is set` -- there is no default class, so nothing will ever bind a claim.
+- **What the CLI must add or change:** a pinned dynamic provisioner plus one
+  **default** StorageClass, for example Rancher `local-path-provisioner` (single-node
+  appliance, node-local volumes, no replication) or `sig-storage-local-static-
+  provisioner`. Bake the provisioner image into the ISO image set, ship its manifest,
+  and annotate the class with
+  `storageclass.kubernetes.io/is-default-class: "true"` so a PVC that names no class
+  still binds. Do not make the default class wait on anything optional.
+- **Where it should run:** at install time, with the other addons (Calico, CoreDNS,
+  metrics-server) -- i.e. after the CNI and a Ready, untainted node.
+- **How to verify it works:** on the KubeOS VM --
+  `kubectl get sc` shows one class marked `(default)`;
+  `kubectl create -f` a 1Gi PVC with no `storageClassName` and
+  `kubectl get pvc` reports `Bound` with a capacity; `kubectl get pv` shows the
+  matching volume. Then the dashboard's Storage pages list that claim, volume and
+  class instead of "No data to be shown.".
+- **Temporary workaround used for testing (if any):** none installed, deliberately.
+  The check was a throwaway namespace `kubeos-storage-test` with a 1Gi PVC
+  (`cli-check`), used to observe `FailedBinding` and to confirm the dashboard renders a
+  PVC correctly; both were deleted afterwards
+  (`kubectl delete namespace kubeos-storage-test`). Nothing is left on the node.

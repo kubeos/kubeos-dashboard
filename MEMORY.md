@@ -172,10 +172,13 @@ browser warning expected). No login prompt (see §6).
 
 ## 7. Open items (do these before this ships in an ISO)
 
-1. **Storage section shows no data** — the maintainer's last, unanswered question.
-   KubeOS ships no dynamic storage provisioner (no StorageClass / local-path), which is
-   the expected cause; confirm before answering, and if it is the cause it belongs in
-   `CLI_REQUIREMENTS.md` and as a handoff, not a hand-install.
+1. **Storage section shows no data** — investigated and answered: the cluster has zero
+   PVCs, PVs, StorageClasses and CSI drivers, and the dashboard's SA gets HTTP 200 with
+   `items: []`, so the empty pages are honest. A test PVC stayed `Pending` with
+   `FailedBinding: no persistent volumes available for this claim and no storage class
+   is set`, i.e. there is no provisioner and no default class. Now item 4 in
+   `CLI_REQUIREMENTS.md`; the fix (pinned local-path provisioner + default
+   StorageClass) belongs to the KubeOS side as a handoff, not a hand-install.
 2. **Auth is the real gap.** Replace the hand-made `clusterrolebinding
    kubeos-dashboard-headlamp-admin` → `cluster-admin` with a read-mostly scoped
    ClusterRole, and decide how a user authenticates (short-lived token printed at first
