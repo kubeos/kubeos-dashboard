@@ -3,13 +3,62 @@
 Written to be read at the start of a session, after `AGENTS.md`. It is the durable
 record of decisions, machine facts and history so no session has to rediscover them.
 
-Last updated: 2026-11-08 (session B, this one). Started from the transcript of session
+Last updated: 2026-11-08 22:20 (session C, the first combined KubeOS+dashboard session; see
+the RESUME block below before anything else). Started from the transcript of session
 `session-956734de-8e0e-4798-8bee-5f8bcf2eabd5` (42 turns, 469 steps) and has been
 kept current by hand ever since.
 
 No secrets here by design: no tokens, no private keys. See §10 for where those live.
 
 ---
+
+---
+
+## RESUME HERE TOMORROW (written 2026-11-08 22:20, before the host was powered off)
+
+The host PC will be switched off. **Nothing is lost**: the three VMs, etcd,
+the containerd stores, the helm release and the TLS secret are all on the VM disks.
+Two one-command scripts now exist so no session starts by rediscovering the setup.
+
+```sh
+cd ~/headlamp/_kubeos-dashboard
+./up.sh                 # start the 3 VMs, wait for API + 3 nodes Ready + dashboard, print the URL
+./up.sh --check         # same, verify only, starts nothing
+./redeploy.sh           # after editing kubeos-branding/src/: npm build -> image -> load on all 3 nodes -> helm upgrade
+./redeploy.sh --no-build  # skip the build, just re-load the image and helm upgrade
+```
+
+`up.sh` was tested in `--check` mode at 22:20 and printed: 3 nodes Ready, dashboard pod
+`1/1 Running` on kubeos2, and HTTP 200 on `:30443` for `.4`, `.5` and `.6`.
+`redeploy.sh` was **not** run end to end (it would have re-deployed an unchanged image);
+its build half was proven separately — `npm ci` (843 MB, 39 s) then `npm run build`
+produces a byte-identical `dist/main.js` (76 882 bytes).
+
+**State at shutdown (verified 22:20):** cluster `kubeos`(.4 control-plane) +
+`kubeos2`(.5) + `kubeos3`(.6), all Ready; 16/16 pods Running; dashboard release
+`kubeos-dashboard` in `kubeos-system`, one Ready pod on kubeos2; `https://192.168.122.4:30443`.
+KubeOS repo at `a4ea487`, this repo at `ac41643`, both on `development`, both clean
+except the memory edits.
+
+**The trap found today, and why the shutdown would have gone wrong:** `kubelet` on
+**kubeos2 was `disabled`** (a joined node, unlike .4/.6 built from the ISO where hook
+9050 enables it). A powered-off host would have booted kubeos2 into **NotReady**, and
+because the dashboard pod happens to be scheduled there, the dashboard would have been
+gone with no obvious cause. Fixed with `systemctl enable kubelet` on .5, then **proved by
+really rebooting kubeos2**: node came back Ready, kubelet `enabled/active`, dashboard pod
+restarted on a new pod IP (`.77`) and `:30443` answered 200 again. `up.sh` now warns if any
+node reports `kubelet` not `enabled`. **Whenever a node is joined by hand, check
+`systemctl is-enabled kubelet` on it.**
+
+**Not tested:** reboot of the control-plane VM `.4`. Its `kubelet` and `containerd` are
+both `enabled`, and etcd/static pods restart from disk, but a control-plane reboot is
+untested here — if the cluster does not come back tomorrow, start there
+(`systemctl status kubelet`, `journalctl -u kubelet -b`, `crictl ps -a`).
+
+**Still open (unchanged):** `local-path` `volumeBindingMode: Immediate` defect,
+dashboard authentication/scoped RBAC (today `cluster-admin`), join hardening, and
+packaging the dashboard into the ISO (`9031` hook + `kubeos-cluster-ready` step 8).
+Memory edits in both repos are **uncommitted** — commit them first thing.
 
 ## How this file stays current
 
@@ -49,12 +98,19 @@ of truth for behaviour questions — this project never edits it).
 
 ## 2. Machines and access
 
+**Standing access permission (user, 2026-11-10):** "you have permission for them how you
+have permission for KubeOS" — `~/kubeos-dashboard` and `~/headlamp` (including
+`_kubeos-dashboard/`) may be edited, built and deployed **without asking for approval
+each time**: read, write, `npm run build`, `docker build`, `docker run`, `scp`/`ssh` to
+the test node. This covers *file and tool access only* — `git commit` / `git push` still
+need an explicit yes (AGENTS.md §3), and the ISO tree is still edited by its own rules.
+
 | Machine | Address | Facts |
 |---|---|---|
 | Host (this box) | — | docker works (`docker version` succeeds). No `kubectl`, no `helm`. |
 | Builder VM | `root@192.168.122.2` | Debian 13.7, node 20.19.2 / npm 9.2.0, git + GitHub SSH as `skmdab`, no docker. Authoritative git working tree at `/root/kubeos-dashboard`. |
 | KubeOS node | `root@192.168.122.4` | KubeOS Linux v1.0 "Orhan", k8s v1.37.2, containerd 2.4.2, `helm` present, no docker, 2 vCPU / 1.9 GiB. Calico + CoreDNS running. |
-| KubeOS node 2 | `root@192.168.122.5` | Second KubeOS install (2026-11-08), hostname `kubeos2`, joined to `main` **by hand** as a worker. Same ISO/image set. Reached with the same `.vm_key`. |
+| KubeOS node | `root@192.168.122.5` | **The only live node since 2026-11-10.** Fresh KubeOS install, VM `kubeos`, hostname `kubeos`, own control-plane (the 2026-11-08 two-node pair at .4/.6 is gone). k8s v1.37.2, containerd 2.4.2, root-only login, 25 GB `vda` (VG `kubeos-vg`, 1.00g free) plus a **10 GiB `vdb`** used for LVM testing. Same `.vm_key`. |
 
 Helpful scripts and materials from earlier sessions live **outside the repo** in
 `/home/shaik/headlamp/_kubeos-dashboard/`: `vm.sh` (run on builder), `node.sh` (run on
@@ -120,8 +176,9 @@ docker run --rm --network host -v "$PWD":/shots -v /etc/hosts:/etc/hosts:ro \
   --entrypoint node zenika/alpine-chrome:with-puppeteer /shots/<script>.js
 ```
 
-Live dashboard: **https://192.168.122.4:30443** (NodePort, self-signed cert →
-browser warning expected). No login prompt (see §6).
+Live dashboard: **https://192.168.122.5:30443** (NodePort, self-signed cert →
+browser warning expected; the single test VM at 192.168.122.5 is VM `kubeos`, the old
+.4/.6 machines are gone). No login prompt (see §6).
 
 ## 5. Session history (append-only)
 
@@ -449,11 +506,170 @@ changed when the dashboard needs it, **the KubeOS CLI is frozen** — CLI gaps g
     to make this automatic (the dashboard labelling any node that appears without a role label, the
     way k3s/RKE2 do) or to log it as a CLI requirement for first boot/join.
 
+- **2026-11-08 21:50 — maintainer: "why all pods showing as unhealthy" (screenshot of the dashboard).
+  Not a defect: the screenshot is Headlamp's Warning *events* table, not a pod list.** The tell is
+  the column set `Type | Name | Namespace | Node | Reason | Message | Count | Last Seen` — a Pods
+  list has `Status`/`Restarts`/`Age`, never `Reason`/`Count`/`Last Seen`. The rows are historical
+  warnings; `Unhealthy` is the event *reason*, and "12m / 44m …" is `Last Seen`. Verified live on
+  `.4` (3h53m-old cluster, 3 nodes Ready): **16/16 pods 1/1 Running, 0 restarts, no Warning event in
+  the last 5 minutes, BGP full mesh Established on all three nodes** (`Mesh_192_168_122_4/5/6`).
+  What the listed rows actually were: (a) `calico-node-6c275` on kubeos3 "BIRD is not ready / BGP not
+  established with 192.168.122.4,192.168.122.5" for ~2 min after the join — the normal bootstrap
+  window, self-heals once the mesh comes up; (b) `calico-node-67fhd` = the *pre-reset* calico pod on
+  kubeos3 stuck terminating, `FailedPreStopHook` (leftover from the wipe/rebuild); (c) three
+  `kubeos-dashboard-headlamp-*` pods from **three separate ReplicaSets** (`5f679c8f8b`, `7f6b7db478`,
+  `645d8c8cb6`), i.e. three `install-dashboard.sh` runs minutes apart, each new replica probing
+  `https://10.244.120.7x:4466` before its server listened → `connection refused`; only the last
+  replica survives, Ready; (d) `calico-kube-controllers` readiness "timed out after 1s" once — the
+  probe budget is 1 s and a join on a 4-core host can exceed it. Kubelet keeps events for 1 h
+  (`--event-ttl`), so the feed empties itself. **Lesson for next time: always confirm a dashboard
+  "unhealthy" claim with `kubectl get pods -A` before touching anything — the events page looks
+  like a status page.** No code, config or cluster change was made for this; nothing committed.
+
+- **2026-11-08 22:20 — host about to be powered off; made the setup survivable and found one
+  real breakage.** The maintainer asked whether tomorrow's session could resume this exact
+  setup or would start from scratch. Audit of what survives a shutdown: VM disks, etcd
+  (130 MB under `/var/lib/etcd`), both images in **every** node's containerd store
+  (`headlamp:kubeos-0.1.0`, `kubeos-join-helper:0.1.0`), helm release, TLS secret, the SSH
+  key and `admin.conf` in `~/headlamp/_kubeos-dashboard/`, both git repos — all persistent.
+  Missing/at risk: **libvirt has no autostart** (`/etc/libvirt/qemu/autostart/` does not
+  exist), **`node_modules` was absent** so `npm run build` would have failed, no resume
+  runbook, and memory edits uncommitted. **The real find: `kubelet` was `disabled` on
+  kubeos2** (`enabled` on .4 and .6 — the ISO's hook 9050 enables it, a hand-joined node
+  does not get it); that node would have booted **NotReady**, and the dashboard pod is
+  scheduled on kubeos2, so the dashboard would have silently vanished tomorrow. Fixed with
+  `systemctl enable kubelet` and **verified by rebooting kubeos2 for real**: node Ready,
+  kubelet enabled/active, dashboard pod re-created on `10.244.120.77`, HTTP 200 on `:30443`.
+  Then: `npm ci` in `kubeos-branding` (843 MB, 39 s; 3 packages' install scripts were blocked
+  by npm but the build still works) — `npm run build` reproduces a byte-identical
+  `dist/main.js` (76 882 B); wrote `~/headlamp/_kubeos-dashboard/up.sh` (start the 3 VMs,
+  wait for API + 3 nodes Ready + dashboard pod, print URL, warn if any kubelet is disabled)
+  and `redeploy.sh` (npm build → docker build → load image on all 3 nodes → helm upgrade →
+  verify). Both `sh -n` clean; `up.sh --check` tested live. **Control-plane reboot of .4 was
+  deliberately not tested** (it would take the whole cluster down with no console access) —
+  its units are enabled, so it should come back, but that is an assumption, recorded as such.
+
+- **2026-11-09 11:27 — resume after a real overnight power-off: everything came back by itself.**
+  The RESUME block above was written before the shutdown; this is the proof it works. Host
+  rebooted (~09:46), the maintainer started the VMs, then restarted them at 11:24:44. With no
+  intervention from me: 3/3 nodes Ready, 16/16 pods Running, kubelet+containerd enabled/active on
+  all three, no OOM kills, and the dashboard answering HTTP 200 on `:30443` for `.4`, `.5`, `.6`.
+  The dashboard pod shows 3 restarts — **all of them node reboots** (`SandboxChanged` events, new
+  pod IP each time: `.77` → `.78` → `.79`), not crashes; that is worth remembering before anyone
+  reads a restart count as a bug. The cluster also serves the **current** bundle:
+  `/plugins/kubeos-branding/main.js` is byte-identical to `dist/main.js` (76 882 B).
+  `./up.sh --check` confirmed all of it in one command. **Host memory is the new risk:** 7.6 GiB
+  total, four 2 GiB VMs (three nodes + `builder`), 6.9 GiB used / ~170 MiB free — shut `builder`
+  down when not building an ISO.
+
+- **2026-11-09 13:05 — pivot to the KubeOS CLI side (installer partitioning).** The maintainer said
+  "now we move to KubeOS cli part" and lifted the CLI freeze **for storage/installer work only**;
+  image baking, dashboard install, /etc/issue URL and multi-node joiner mode are still frozen. The
+  first piece is a Proxmox-style guided partition flow in the installer (disk picker + root size +
+  swap size, everything else automatic, no guided/manual menu). Nothing in this repo changed; the
+  dashboard's own queue is unchanged. Two follow-ups that came out of the CLI discussion and affect
+  this project: (a) the original "storage" item is still open — the shipped `local-path` class uses
+  `volumeBindingMode: Immediate`, which is why first boot wastes 2 min 8 s on a claim that can never
+  bind and why the Storage pages stay empty; (b) `kubeos-cluster-ready` may get a live first-boot
+  progress banner on `/etc/issue` (maintainer approved the idea), which matters for the dashboard
+  because today a first boot looks finished while it is still running.
+
 ### Next session — start here
 
 Copy this block when beginning: confirm branch + sync on both machines, read §7 open
 items, then ask. The most likely next piece of work is the auth scoping (open item 2)
 or whatever the maintainer reports after clicking around.
+
+### Session — 2026-11-10 17:30 → 18:05 (Disks section, Proxmox shape)
+
+1. **Rejected first attempt, new spec.** The first Disks page was nested inside Headlamp's
+   Storage group; the maintainer rejected it and sent two screenshots (Proxmox VE node menu)
+   with the words "i want exact like proxmox which is Disks—LVM—LVMThin only this two" and
+   "Disks field need to be in the middle of Storage of Network.. not in Storage". The
+   screenshots were deleted after being read, as instructed.
+2. **Rewritten `src/disks.tsx`.** Top-level `Disks` group (icon `mdi:harddisk`) with exactly
+   two children, `LVM` → `/kubeos-disks/lvm` and `LVM-Thin` → `/kubeos-disks/lvm-thin`; one
+   page each, Proxmox-style grid with a lime usage bar, a thin-volume sub-table under the
+   pool, and a shared toolbar (node, timestamp, Refresh). The group links to its first child,
+   so clicking "Disks" opens LVM and expands the two children.
+3. **Sidebar position.** Impossible through the plugin API (§8); solved with a guarded DOM
+   move of our own nodes after render, documented in the file header.
+4. **Bug fixed on the way.** `ApiProxy.request(path, false, {})` is the wrong signature
+   (2nd arg is `RequestParams`, 3rd `autoLogoutOnAuthError`); now `ApiProxy.request(path)`.
+5. **Verified live** on 192.168.122.5 with the alpine-chrome container: sidebar order is
+   Map, Workloads, **Storage, Disks (LVM, LVM-Thin), Network**, Gateway (beta), …; LVM page
+   shows `kubeos-vg 24.49g / 1.00g free / /dev/vda3 / 4 LVs`; LVM-Thin shows `kubeos-data
+   12.25g, 0.5 % data, 10.1 % metadata, chunk 64.00k, 1 volume`, thin volume `pod-data`.
+6. **KubeOS side (ISO tree, left uncommitted there).** `kubeos-disks-report` now publishes an
+   explicit `lvs` column list that includes `chunk_size` (lvm's default report has no such
+   column, which is why the Chunk cell was empty) and compares the report payload instead of
+   the timestamp — the old check included `generated`, so it never matched and the ConfigMap
+   was rewritten every minute. Deployed to .5 by hand (`tar … --strip-components=2` into `/`)
+   and verified: "unchanged; not rewriting the ConfigMap".
+7. Tooling: `redeploy.sh` now targets only 192.168.122.5, and `install-dashboard.sh` does a
+   `rollout restart` after `helm upgrade` (same image tag ⇒ helm alone leaves the old pod).
+8. **Follow-up the same evening (maintainer sent `Whygonetobottom.png`):** Disks was in the
+   right place but LVM/LVM-Thin rendered under "Join node". Two React placement effects
+   (§8): a remounted Collapse is appended at the end, and Storage's own child list is
+   inserted before the *next entry's* node — which was our Disks row, so opening Storage
+   nested its PVC list under Disks. The shim now finds child lists by content and re-seats
+   Storage's row, Storage's list, our row and our list as one block. Verified by clicking
+   through the sidebar (load → Disks → LVM-Thin → Storage → Disks → LVM): every step ends
+   with `Storage [PVCs…]` and `Disks [LVM, LVM-Thin]` correctly nested and no page errors.
+
+### Session — 2026-11-10 18:10 → 19:40 (Create: Volume Group / Create: Thinpool)
+
+1. **Request.** "when i click LVM it should show 'Create: Volume Group' beside .. exact below
+   global search bar and when user click the button it should ask Disk field and it shows disk
+   list and name field and create button for creating vg and same goes to LVM Thin … it should
+   show 'Create: Thinpool'". Placement means the **section header's right edge** — that is the
+   `SectionBox` `headerProps.actions` slot, i.e. exactly under the global search bar.
+2. **UI.** `src/disks.tsx` now gives each page a `SectionBox` whose `actions` holds the
+   `Create: Volume Group` / `Create: Thinpool` button, and a MUI `Dialog` each: VG = Disk select +
+   Name; thin pool = Volume Group select (`kubeos-vg — 1.00g free of 24.49g`) + Name + optional
+   Size. Client-side validation: name `^[A-Za-z0-9][A-Za-z0-9+_.-]{0,126}$`, device
+   `^/dev/[a-z]+[a-z0-9]*$`, size `^[0-9]{1,6}(\.[0-9]{1,3})?[mMgGtT]$`; empty size ⇒ `-l 100%FREE`.
+3. **How the write actually happens.** The browser cannot run LVM, so the plugin creates a
+   one-shot privileged `batch/v1` Job (hostPID, `privileged: true`, hostPath `/`→`/host,
+   `nsenter -t 1 -m -u -i -n -p`) using the same helper image as the "Join node" feature, waits
+   ≤60 s for it, then deletes it (ttl 600 s as a backstop) and pokes `kubeos-disks-report.service`
+   so the ConfigMap is fresh on the next Refresh. Shell script is built as one `set -e` string with
+   the validated values only — the dialog text tells the user this runs as root on the node.
+4. **Disk list source.** The report ConfigMap could not answer "which disk is empty", so the KubeOS
+   side of `kubeos-disks-report` now also publishes `lsblk.json`
+   (`lsblk -b -J -e 7 -o NAME,KNAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS`). The select filters to `type:
+   disk`, no fstype, no children and not already a PV — after `testvg` was created `/dev/vdb`
+   correctly vanished and the dialog said "No free disk on this node…".
+5. **Verified end to end on 192.168.122.5** (headless Chrome + real clicks): VG dialog →
+   `vgs` = `testvg <10.00g 0 /dev/vdb`; Thinpool dialog → `lvs` = `testpool testvg 9.97g
+   twi-a-tz--`; `kubectl -n kubeos-system get jobs` back to "No resources found"; the LVM table
+   then listed `testvg` and LVM-Thin listed `testpool`. `kubeos-vg` untouched.
+6. **Test traps worth keeping.** In a MUI `Select` dialog the first `input` is a hidden a11y input,
+   so type by element **id** (`kubeos-vg-name`, `kubeos-thin-name`, `kubeos-thin-size`) — otherwise
+   the text goes nowhere. An unconditional `Escape` at the end of a step closes the whole dialog;
+   only press it while `li[role="option"]` is still open.
+7. **Left on the node on purpose:** `testvg` on `/dev/vdb` and `testpool` (9.97g) inside it —
+   visible proof, removable with `vgremove -f testvg` (remove the pool LV first if LVM objects).
+   The spare 10 GiB disk is now consumed; a fresh ISO test will not have it.
+   **Correction made right after (19:39):** `vgremove` leaves an orphan PV label on the disk
+   (`pvs` still lists `/dev/vdb` with an empty `vg_name`, and `lsblk` then reports
+   `fstype: LVM2_member`), so the first filter — "no fstype and not a PV" — declared *no free
+   disk* after a delete, and would do the same on any reinstall. `freeDisks()` now excludes a disk
+   only when it is a PV **with** a volume group, offers an orphan-PV disk labelled
+   `/dev/vdb — 10.00 GiB (old LVM label, wiped)`, and `pvcreate -ff` wipes it before `vgcreate`.
+   Re-verified end to end after rebuilding (`create-1..7-*.png`, 19:39): dialog lists the disk,
+   `vgs` = `testvg 10.00g`, `lvs` = `testpool testvg 9.97g twi-a-tz--`, `page errors []`.
+8. **The Job is not deleted by the plugin** — `ttlSecondsAfterFinished: 600` removes it, so a
+   finished `kubeos-lvm-{vg,thin}-*` Job and its Completed pod stay visible for ten minutes. That
+   is deliberate-ish: the pod log is the only record of the root commands that ran. If a scoped
+   role ever lacks `delete jobs`, nothing breaks.
+9. **Final polish pass (19:50).** `sizeText()` also had to `trim()`: lvm pads an exhausted space as
+   `"0 "` (see `vgs.json` → `"vg_free":"0 "`), so a full group showed `0 free of 10.00g` and the
+   hint read `(0 )`; it now renders `0g` and drops the parenthetical. The thin dialog's VG label and
+   size hint went through `sizeText()` too — they were still printing lvm's raw `<10.00g`. Final
+   bundle `dist/main.js` 93 914 B, md5 `30ed4af1…`, served copy on the node identical. Everything
+   re-verified from a clean disk: `pvremove` → dialog shows `/dev/vdb — 10.00 GiB empty` → create
+   `testvg` → create `testpool` → tables correct, `page errors []`.
 
 ## 6. Current live state
 
@@ -543,6 +759,12 @@ below):**
    promise); the theme seeds itself with one reload on a browser's very first visit;
    the CLI's 16-colour console palette is deliberately *not* mapped to ANSI (index 7 is
    the panel background, so copying it would make `\e[30m` render light).
+10. **The create path is the dashboard's only write action — and it runs as root on the node**
+   (LVM create via a privileged one-shot Job, see §5 2026-11-10 19:40). Item 2's scoped
+   ClusterRole therefore cannot be read-only: it needs `create jobs` (+ `delete` for cleanup)
+   in `kubeos-system`, and the namespace must keep allowing privileged pods (no PodSecurity
+   `restricted` label). Decide deliberately whether that is acceptable for the product, or gate
+   it behind an explicit "storage admin" role/token. Nothing else in the plugin writes.
 
 ## 8. Headlamp internals worth remembering
 
@@ -565,6 +787,28 @@ below):**
 - Chart probes default to HTTP; with TLS on, `probes.scheme: HTTPS` is mandatory.
 - `pluginsManager` must stay disabled: it needs internet at runtime and would empty-dir
   over `/headlamp/plugins`, hiding the baked-in plugin.
+- **A plugin cannot choose its sidebar position.** `registerSidebarEntry` has no
+  index/priority option and `useSidebarItems.tsx` *pushes* every custom entry onto the
+  end of the in-cluster list; `registerSidebarEntryFilter` runs per item, so it can drop
+  or modify entries but never reorder them. `settings.sidebarSortAlphabetically` re-sorts
+  by label and would put Storage last, so it is not a lever either. KubeOS wants Disks
+  between Storage and Network (Proxmox order), so `src/disks.tsx` moves its own nodes in
+  the DOM after render (guarded, idempotent, no-op if the markup changes).
+- The sidebar DOM for one top-level entry is `<li><a href=…>…</a></li>`, and the open
+  group's child list is a separate `<li>` (a `MuiCollapse` with no direct `<a>` child). A
+  group with no `url` links to its **first child**, so Storage's anchor is
+  `/c/main/storage/persistentvolumeclaims`, not `/c/main/storage` — matching on
+  `href$="/storage"` finds nothing. A parent entry is `isSelected` (and therefore
+  expanded) whenever one of its children is the current route (`getIsSelected` recurses).
+- **Where React puts that child list is the hard part.** A freshly mounted Collapse is
+  inserted with a null reference (`insertBefore(node, null)`), so it appears at the END of
+  the sidebar; and when it *does* find a next sibling, React uses the **next entry's DOM
+  node** as the reference, so anything a shim squeezed between two entries steals the
+  child list of the entry above it (Storage's PVC list appeared nested under Disks).
+  Consequences for any DOM reordering: locate child lists by *content*, never by position,
+  and re-seat the neighbouring blocks **together** (Storage row, Storage list, Disks row,
+  Disks list) instead of moving one node at a time. Reloading a URL hides both bugs;
+  verifying by *clicking* the sidebar exposes them.
 
 ## 9. Mistakes made before, don't repeat
 

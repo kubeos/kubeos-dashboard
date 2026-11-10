@@ -14,6 +14,9 @@ import { BRAND, PRODUCT_NAME } from "./brand";
 // The "Add node" page: join further machines to this cluster from the dashboard.
 // Imported for its side effect -- it registers its own route and sidebar entry.
 import "./addnode";
+// The "Disks" page: LVM volume groups and thin pools, read from the ConfigMap the
+// node publishes. Imported for its side effect, like addnode above.
+import "./disks";
 import { kubeosTheme } from "./theme";
 
 /**
