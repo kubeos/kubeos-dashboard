@@ -3,6 +3,23 @@
 Read this file at the start of every session and follow it for the whole session.
 If a rule here conflicts with what you were about to do, the rule wins. If you are unsure, ask me.
 
+## 0. Where to start, and how a session survives being cut off
+
+**Start of every session:** read this file, then `MEMORY.md` (its `RESUME HERE` block at the top).
+The cross-project card `~/KubeOS/RESUME.md` is the single entry point for the whole KubeOS effort —
+read it too when the work touches both the ISO tree and the dashboard.
+
+**End of every work item:** update `MEMORY.md` (append a dated session block; refresh the open-items
+list) so a session that dies mid-thought costs nothing. The user's standing instruction
+(2026-11-10): *"when I open a new session I need to explain from starting, it is very frustrating
+every time"*. A session can end without warning — context limit, closed window, dead network — and
+the next one must be able to continue from files, not from the user's memory.
+
+- The transcript of every session is kept in `~/.dsh/sessions/<workspace>/<session-id>/`; the same
+  session can be reopened from the GUI's **Sessions** list, which keeps full context. That is the
+  first thing to try when a session is interrupted.
+- A *new* session needs only the paste line at the top of `~/KubeOS/RESUME.md`.
+
 ## 1. Project overview
 
 - **kubeos-dashboard** is the web dashboard for **KubeOS**, built on top of **Headlamp** (the Headlamp repo is cloned on the host).
