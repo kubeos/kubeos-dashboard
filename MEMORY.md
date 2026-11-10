@@ -670,6 +670,12 @@ or whatever the maintainer reports after clicking around.
    bundle `dist/main.js` 93 914 B, md5 `30ed4af1…`, served copy on the node identical. Everything
    re-verified from a clean disk: `pvremove` → dialog shows `/dev/vdb — 10.00 GiB empty` → create
    `testvg` → create `testpool` → tables correct, `page errors []`.
+10. **Committed and pushed (20:20, after the maintainer said "NOW IT IS PERFECT JUST PUSH
+   DEVELOPMENT").** `development` = `a30aea1` "feat(disks): Proxmox-style Disks section with LVM,
+   LVM-Thin and create dialogs" — `src/disks.tsx`, the one-line import in `src/index.tsx`, the
+   rebuilt `dist/main.js` (93 914 B) and this file. `main` untouched at `30d8d26`. The matching
+   KubeOS commit is `633771b`/`7cf9f26` on `development` (`skmdab/KubeOS`). The maintainer's own
+   screenshot `Whygonetobottom.png` was left untracked in the repo root on purpose.
 
 ## 6. Current live state
 
