@@ -1125,3 +1125,89 @@ Measured header order: `Restart`, `Power off` (amber), `Shell`.
   say why and put the unblocking action next to it. Verification detail worth keeping: the NFS table is
   a div grid (no `<tr>`), so a browser test locates a row by the innermost `div` that carries the
   volume name and exactly two buttons.
+
+### Session 2026-11-11 (later evening) — the dashboard as a BINARY + systemd unit
+
+User: *"from now i want to build as binary so it can be deployed as systemd service"*, and
+explicitly **dashboard-side first, KubeOS tree only afterwards**. Built and verified on the
+real node; nothing in the KubeOS tree was touched.
+
+- **New `deploy/binary/`**: `build-binary.sh` (assembles the release), `install.sh`,
+  `uninstall.sh`, `kubeos-dashboard.service`, `kubeos-dashboard.env.example`, `README.md`.
+  Output `release/kubeos-dashboard-0.1.0-linux-amd64.tar.gz`: **50 MB compressed, 122 MB
+  unpacked, 828 files**, sha256 `35c188c1…`. `/release/` added to `.gitignore`.
+- **Where the binary comes from, and why not compiled here**: upstream Headlamp publishes
+  no standalone server binary (release assets are Electron desktop builds), and its
+  `go.mod` needs **Go 1.26**, which the host does not have. So the build fetches the two
+  layers of the pinned image `headlamp-k8s/headlamp:v0.46.0` that contain exactly what a
+  host install needs — `headlamp/headlamp-server` (layer `sha256:f745ef79…`, 40.2 MB) and
+  `headlamp/frontend/` (`sha256:1030333…`, 12.1 MB) — via the ghcr.io token + blob API
+  **without docker**, verifying each blob's sha256 against the digest. The image's 52 MB
+  `chown` layer and its base OS are deliberately not used. Proven end to end before writing
+  the script.
+- **Verified on `192.168.122.5` on a spare port (31443), alongside the Pod**: HTTPS **200**,
+  `/c/main/` URLs, nodes page with live CPU/memory, NFS page, no page errors, service
+  **active with 0 restarts**, `MemoryCurrent` **55 MB**, `systemd-analyze verify` clean,
+  **no warnings at all** in `journalctl -u kubeos-dashboard -p warning`, and `kubectl get
+  pods -A` still shows only the old dashboard Pod — the binary adds nothing to the cluster.
+- **Two bugs that only the browser found**: (1) every URL was `/c/kubernetes-admin@kubernetes/`
+  because **Headlamp uses the kubeconfig CONTEXT NAME as the cluster id**, so `/c/main/...`
+  did not exist and the nodes page redirected to login — `install.sh` now renames the
+  context in its own copy of the kubeconfig to `main` (parity with the in-cluster id) and
+  pre-flights the identity with `kubectl get --raw=/version`; (2) the page title read
+  `main - Cluster - KubeOS` in **both** deployments, so `--app-name=KubeOS` reaches the
+  title and the container was never special. Also learned: the cert files must be readable
+  by the service user (0644 crt / 0600 key owned by `kubeos-dashboard`), and the unit sets
+  `HOME=/var/lib/kubeos-dashboard` because headlamp-server writes its own kubeconfig cache.
+- **Repo synced to the builder VM** (`rsync`, same HEAD `71d5ad1`, `deploy/binary/` and the
+  `.gitignore` change now present there as uncommitted). The builder's SSH key is
+  `~/headlamp/_kubeos-dashboard/.vm_key`, NOT `id_ed25519_skmdab` (that one is refused).
+- **Left for the next step (user's call):** commit this work; and the cutover — the Pod and
+  the service cannot share 30443, so the Helm release must be removed before the binary takes
+  over that port (the user has not answered that yet). Then the KubeOS-side integration
+  (vendoring hook, unit in the ISO tree, scoped identity) which the user wants done last.
+
+### Session 2026-11-11 (night) — CUTOVER: the Pod is deleted, the binary owns 30443
+
+The user: *"now remove dashboard pod kubeos live system and deploy binary dashboard to kubeos live
+system with systemd.. so we can see it"*. Done on the node (`192.168.122.5`, hostname `kubeos`):
+
+1. **Removed the release, not the namespace.**
+   `helm -n kubeos-system uninstall kubeos-dashboard` — `helm get manifest` first confirmed what it
+   owns: Deployment `kubeos-dashboard-headlamp`, Service `kubeos-dashboard-headlamp`
+   (`NodePort 80:30443`), ServiceAccount, Secret `oidc`, ClusterRoleBinding
+   `kubeos-dashboard-headlamp-admin` -> `cluster-admin`. The **namespace is not in the manifest**
+   (helm only created it), so `kubeos-system` survived — a namespace labelled
+   `app.kubernetes.io/managed-by=Helm` would have been deleted with everything else in it, so
+   checking that before uninstalling is the habit worth keeping.
+   Result: `kubectl get pods -A` -> **No resources found**, port 30443 free.
+2. **Re-ran the installer against 30443** (not a hand-edited env file):
+   `/tmp/kubeos-dashboard-0.1.0-linux-amd64/install.sh --kubeconfig /etc/kubernetes/admin.conf
+   --port 30443`. This exercised the documented upgrade path for the first time: files replaced,
+   kubeconfig re-copied, context renamed `kubernetes-admin@kubernetes` -> `main` **again** (the
+   source `admin.conf` still has the old name, so the rename must stay in the installer and stay
+   idempotent), identity pre-flight `get --raw=/version` OK, **existing certificate kept**
+   (`tls.crt`/`tls.key` present -> no regeneration, so browsers keep trusting it), env file
+   rewritten, `HTTP 200` from the readiness loop.
+3. **Verified.** `active`, `NRestarts=0`, RSS 52.7 MB, 30443's only listener is `headlamp-server`,
+   journal: `Proxy setup` with `context: main` then `HEADLAMP_BACKEND_READY`. From the host,
+   `https://192.168.122.5:30443/` and `/c/main/` -> 200. In a browser
+   (`_kubeos-dashboard/binary-30443-check.js`): title `main - Cluster - KubeOS`, top bar
+   `Restart | Power off | Shell`, Overview **Pods 0 / 0 Requested** (the cluster really is empty),
+   Nodes **1/1 Ready** with live CPU/memory bars, **0 page errors**.
+
+**Consequences worth knowing.**
+- The dashboard is now a **host process, so it is invisible to Kubernetes**: it does not appear in
+  `kubectl get pods`, in the pods count, or in the Pods page — the Overview's "Pods 0 / 0" is
+  correct, not a regression. Anything that used to be diagnosed through the dashboard's Pod (restarts,
+  liveness) is now `systemctl status|journalctl -u kubeos-dashboard`.
+- **The old "dashboard Pod restarts once at boot" wart is gone by deletion**: no container, no
+  liveness probe; the unit is ordered after `kube-apiserver.service` and `Restart=always` handles a
+  slow API. The open `initialDelaySeconds` item in `deploy/values.yaml` only matters again if the
+  Pod deployment is ever used.
+- The RBAC story changed too: the Pod used `cluster-admin` through a ClusterRoleBinding. The binary
+  uses the **`/etc/kubernetes/admin.conf` copy** in `/etc/kubeos-dashboard/kubeconfig`, i.e. also
+  cluster-admin — so the narrow-identity question (`kubeos-dashboard` ClusterRole + the
+  `nodes/proxy` grant) is still open and still belongs to the KubeOS-integration increment.
+- Left on the node on purpose: `/tmp/kubeos-dashboard-0.1.0-linux-amd64{,.tar.gz}` (the release used
+  for the install; `/tmp` clears on reboot).

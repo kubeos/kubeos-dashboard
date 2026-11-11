@@ -50,6 +50,43 @@ docker build -f image/Dockerfile -t ghcr.io/skmdab/headlamp:kubeos-0.1.0 .
 The plugin bundle is built once and committed, because the machine that builds
 the ISO has no Node toolchain.
 
+## Deploy as a binary (systemd, no container)
+
+The dashboard also ships as a **host service**: a static `headlamp-server` binary, the
+built frontend, the KubeOS plugin, a systemd unit and an installer - no container runtime,
+no Pod. This is the form KubeOS itself uses, because the node runs its control plane as
+host services and keeps no base Pods.
+
+```sh
+cd kubeos-branding && npm run build && cd -   # rebuild the plugin (it is committed)
+deploy/binary/build-binary.sh                 # -> release/kubeos-dashboard-<v>-linux-amd64.tar.gz
+```
+
+On the node:
+
+```sh
+tar -xzf kubeos-dashboard-0.1.0-linux-amd64.tar.gz && cd kubeos-dashboard-0.1.0-linux-amd64
+./install.sh --kubeconfig /etc/kubernetes/admin.conf
+```
+
+`build-binary.sh` needs only curl, tar and sha256sum: it fetches two layers of the pinned
+upstream image - the static `headlamp-server` and the frontend - and verifies each against
+its image digest (a layer digest is the sha256 of its bytes). Upstream publishes no
+standalone server binary, and compiling Headlamp needs Go 1.26, so reusing the released
+binary keeps us on upstream's exact build.
+
+Two things the installer handles that are easy to get wrong:
+
+- **The cluster id is the kubeconfig context name.** Headlamp builds every URL as
+  `/c/<context>/...`, so the installer renames the context in its *copy* of the kubeconfig
+  to `main` - the same id the in-cluster deployment used, so existing links keep working.
+- **`--app-name=KubeOS`** comes from the backend flag, so the page title carries the KubeOS
+  name without the DOM rewriting the plugin used to do.
+
+Everything else lives in [`deploy/binary/README.md`](deploy/binary/README.md): layout,
+options (`--port`, `--san`, `--tls-cert/--tls-key`), the shared-identity model, and the
+unit's hardening.
+
 ## Install
 
 ```sh
