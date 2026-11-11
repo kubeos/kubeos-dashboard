@@ -69,11 +69,14 @@ tar -xzf kubeos-dashboard-0.1.0-linux-amd64.tar.gz && cd kubeos-dashboard-0.1.0-
 ./install.sh --kubeconfig /etc/kubernetes/admin.conf
 ```
 
-`build-binary.sh` needs only curl, tar and sha256sum: it fetches two layers of the pinned
-upstream image - the static `headlamp-server` and the frontend - and verifies each against
-its image digest (a layer digest is the sha256 of its bytes). Upstream publishes no
-standalone server binary, and compiling Headlamp needs Go 1.26, so reusing the released
-binary keeps us on upstream's exact build.
+`build-binary.sh` needs only tar and sha256sum, and **no network**: the two pieces it
+assembles - the static `headlamp-server` and the built frontend - are vendored in
+[`vendor/headlamp/`](vendor/README.md), verified against their image layer digests on every
+build. So a clone of this repository produces a deployable dashboard with no docker, no Go,
+no Node and no registry account. Upstream publishes no standalone server binary, and
+compiling Headlamp needs Go 1.26, so reusing the released binary keeps us on upstream's exact
+build; vendoring it keeps that from turning into a dependency on `ghcr.io`. Upstream's
+`LICENSE` and `NOTICE` travel in the tarball, since it redistributes upstream's binary.
 
 Two things the installer handles that are easy to get wrong:
 

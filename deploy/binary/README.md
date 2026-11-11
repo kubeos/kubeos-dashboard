@@ -7,20 +7,45 @@ everything needed to produce and install that form of it.
 ## Build the release
 
 ```sh
-cd kubeos-branding && npm run build && cd -
+cd kubeos-branding && npm run build && cd -   # only if src/ changed: dist/ is committed
 deploy/binary/build-binary.sh
 ```
 
-That writes `release/kubeos-dashboard-<version>-linux-amd64.tar.gz` (~40 MB compressed,
-~125 MB unpacked) and prints its sha256. It downloads two layers of the pinned upstream
-Headlamp image (`headlamp-server`, the built frontend), verifies each against its image
-digest (a layer digest *is* the sha256 of its bytes), and adds the KubeOS plugin bundle
-and the installer. No docker, Go or Node is needed for that step.
+That writes `release/kubeos-dashboard-<version>-linux-amd64.tar.gz` (~50 MB compressed,
+~125 MB unpacked) and prints its sha256.
+
+**The build needs no network.** The two upstream pieces it assembles - Headlamp's static
+`headlamp-server` and its built frontend - are **vendored in this repository** under
+`vendor/headlamp/<version>/`, and every build re-verifies them against the pinned layer
+digests before restoring anything from them. So a clone of this repository builds a
+working dashboard with no docker, no Go, no Node, no registry account and no `ghcr.io`.
+A single modified byte in a vendored file stops the build with the expected and actual
+digest (`vendor/README.md` explains the provenance and the licence).
+
+The plugin bundle (`kubeos-branding/dist/main.js`) is committed for the same reason, so
+the only optional dependency left, and only when you edit the TypeScript, is `npm`.
 
 Why not compile it ourselves: upstream Headlamp needs Go 1.26, and upstream publishes no
 standalone server binary - only Electron desktop builds. Reusing the static binary from
 the release image keeps us on upstream's exact build instead of maintaining a Go
 toolchain, and the digest pin makes the content auditable.
+
+### Bumping Headlamp
+
+```sh
+HEADLAMP_VERSION=vX.Y.Z \
+BINARY_LAYER=sha256:… FRONTEND_LAYER=sha256:… \
+  deploy/binary/build-binary.sh --vendor
+```
+
+`--vendor` fetches from `ghcr.io`, then rewrites `vendor/headlamp/<version>/` (the two
+layer files, `SHA256SUMS`, `README.md`). Commit that directory with the digest change.
+`--online` ignores `vendor/` and only fetches - useful to check that a new version
+downloads at all before committing 52 MB to git.
+
+The tarball also ships upstream's `LICENSE` and `NOTICE`, because it redistributes
+upstream's binary; `VERSION` inside the release records the upstream version, both layer
+digests and the plugin's sha256.
 
 ## Install on a node
 

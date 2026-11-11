@@ -1231,3 +1231,65 @@ Verified from the **remote** (`git ls-remote --heads origin`): `refs/heads/devel
   **info**-level notes and no errors (SC2094 on the `sha256sums.txt` redirect, which the `find`
   filter already excludes; two SC2015 `A && B || C` shapes in `install.sh`) — left as-is in this
   commit rather than editing a verified installer without re-testing it.
+
+### Session 2026-11-11 (night, cont.) — VENDORED: the build no longer needs ghcr.io
+
+User: *"but i want kubeos-dashboard free of dependecy headlamp. solution.?"* — asked first which of
+three kinds of independence they meant (vendored binaries / forked source / own dashboard); they chose
+**A: vendor Headlamp's binaries in the repo**. So the repo is now self-contained for building, and
+Headlamp remains inside as a *vendored component* rather than a registry dependency.
+
+**What was added**
+
+- `vendor/headlamp/v0.46.0/{headlamp-server.tgz (40 MB), frontend.tgz (12 MB), SHA256SUMS,
+  README.md}` — the two image layers verbatim (50 MB on disk, 52.4 MB of bytes). The per-version
+  `README.md` and `SHA256SUMS` are **generated** by the script (`--vendor`), so provenance cannot
+  drift from what was actually vendored.
+- `vendor/README.md` (hand-written) — why 52 MB is in git, what is vendored and what is not (base OS,
+  the 52 MB `chown` duplicate layer and upstream's bundled plugins stay out), licence/provenance,
+  `sha256sum -c` instructions, the bump recipe, why not git LFS, and an explicit paragraph saying
+  vendoring does **not** make the dashboard our own code.
+- `deploy/binary/README.md` + root `README.md` — the "needs no network" claim, the `--vendor` bump
+  path, and the licence note.
+
+**What changed in `deploy/binary/build-binary.sh`**
+
+- Three modes: `auto` (default — vendored if present, ghcr.io only as a fallback **with a warning**),
+  `--online` (ignore `vendor/`), `--vendor` (fetch, then rewrite `vendor/headlamp/<version>/`), plus
+  `--help` and a hard failure on unknown arguments.
+- A `verify()` helper used on **every** path (vendored, cached and downloaded), so there is one digest
+  check, not three variants of one.
+- `curl` is now needed only by the online paths; the default build needs just `tar` and `sha256sum`.
+- The release now also ships upstream's `LICENSE` + `NOTICE` (we redistribute upstream's binary) and
+  `VERSION` records `upstream-license: Apache-2.0` / `upstream-unmodified: yes`.
+
+**Verified rather than assumed**
+
+1. `--vendor` populated `vendor/` from the existing cache, then `sha256sum -c` → both `OK`.
+2. **Offline build proven:** moved `release/.cache` out of the way and ran the default build with
+   `http_proxy/https_proxy/ALL_PROXY=http://127.0.0.1:9` — it printed `using vendored … (offline,
+   digest verified)` twice and produced the tarball. A build that still wanted the network would have
+   failed on the dead proxy.
+3. **Tamper guard fires:** appended one byte to the vendored `frontend.tgz` → the build aborted with
+   `error: digest mismatch … (got 6170e33f…, want 1030333…)`, and nothing was assembled. File restored,
+   `sha256sum -c` OK again.
+4. `--online` still works (used the cache, no re-download), `--help` prints, `--nope` errors.
+5. **The node is running exactly the vendored bytes:** `sha256` of `/usr/lib/kubeos-dashboard/
+   headlamp-server` on `192.168.122.5` == the binary extracted from `vendor/headlamp/v0.46.0/
+   headlamp-server.tgz` (both `6ac1a7c12560abcf…`), so no reinstall was needed for this change.
+
+New tarball: 830 files (was 828 — `LICENSE` and `NOTICE`), 50 MB compressed, sha256 of that one build
+was `737f7f3b…`.
+
+**Known wart, deliberately not fixed here:** the tarball's sha256 is **not reproducible** — `VERSION`
+carries a `build-date` and `tar` records file mtimes, so every run produces a different sha for
+identical content. Fine for the digests that matter (the vendored layers), but it means "the release
+sha256 is X" is a statement about one build. A normalised tar (`--mtime`, `--sort=name`, `--owner=0`)
+plus `SOURCE_DATE_EPOCH` would make it reproducible; that is a separate, small increment.
+
+Repository size: 1.3 MB of our own code + 52 MB vendored. First push of `vendor/` will be slow.
+
+**Still true:** upstream Headlamp is ~90 % of what runs (server + generic Kubernetes UI); our plugin
+is ~3.7k lines of the KubeOS-specific pages (`disks`, `nfs`, `nodeactions`, `addnode`, theme/brand).
+Removing Headlamp entirely is option C — 3-6 weeks and owning security maintenance — explicitly not
+taken.
