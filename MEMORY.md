@@ -1374,3 +1374,17 @@ table, and what you do not need.
 
 Verified after the push: remote `development` = `a4862f5` (== local), tree clean, builder re-synced
 (`BUILD.md` sha256 identical on host and builder).
+
+### 2026-11-11 (night) — standing rule: memory is updated in BOTH repos, automatically
+
+User: *"ok from now onwards update automatically even it is KubeOS or it is kubeos-dashboard.. save it
+into your memroy"*. Recorded as a permanent rule in this repo's `AGENTS.md` §0 and in
+`~/KubeOS/AGENTS.md` §0, and as a decision in `~/KubeOS/MEMORY.md` §4: **every finished work item updates
+this repo's `MEMORY.md` and the KubeOS `RESUME.md` + `MEMORY.md`, in the same turn, without being asked.**
+This extends the 2026-11-08 "save everything automatically" instruction across both projects, so whichever
+repo the work landed in, both memory files stay true.
+
+Consequence for me, written down so a later session does not drift: a dashboard-only change (the common
+case here) now always ends with a `~/KubeOS` card refresh too — which is why the KubeOS tree carries more
+uncommitted notes than before. Those are notes, not ISO config; the ISO tree itself stays untouched until
+the user says otherwise.

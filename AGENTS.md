@@ -14,6 +14,13 @@ a dated block to `MEMORY.md` (what changed, what was verified, what is left) and
 items. The user's standing instruction (2026-11-11): *"update everytime what you done"*. The point is
 that a session which dies at any second leaves a memory file that is already true.
 
+- **Both repositories, automatically, on every work item** (user instruction 2026-11-11: *"from now
+  onwards update automatically even it is KubeOS or it is kubeos-dashboard"*): every finished item updates
+  this repo's `MEMORY.md` **and** `~/KubeOS/RESUME.md` (§2 by hand, then `sh tools/resume-card.sh --write`)
+  and `~/KubeOS/MEMORY.md`. In the same turn, never batched, never waiting to be asked. When an item only
+  touches one repo, still add the dated one-liner to the other side if it changes what that project is or
+  how it is used — a dashboard change that moves the port belongs in the KubeOS card, and an ISO change
+  that moves where the dashboard runs belongs here.
 - The transcript of every session is kept in `~/.dsh/sessions/<workspace>/<session-id>/`; the same
   session can be reopened from the GUI's **Sessions** list, which keeps full context. That is the
   first thing to try when a session is interrupted.
