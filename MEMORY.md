@@ -1211,3 +1211,23 @@ system with systemd.. so we can see it"*. Done on the node (`192.168.122.5`, hos
   `nodes/proxy` grant) is still open and still belongs to the KubeOS-integration increment.
 - Left on the node on purpose: `/tmp/kubeos-dashboard-0.1.0-linux-amd64{,.tar.gz}` (the release used
   for the install; `/tmp` clears on reboot).
+
+### Session 2026-11-11 (night, cont.) — binary release pushed to `development`
+
+User: *"ok now push to development"*. Two commits on top of `71d5ad1`:
+
+- `ec34d5d feat(deploy): ship the dashboard as a binary and a systemd unit` — `deploy/binary/`
+  (`build-binary.sh`, `install.sh`, `uninstall.sh`, `kubeos-dashboard.service`,
+  `kubeos-dashboard.env.example`, `README.md`) and `.gitignore` (`/release/`).
+- `8e744db docs: record the binary release, the systemd unit and the cutover` — `README.md`,
+  `MEMORY.md`.
+
+Verified from the **remote** (`git ls-remote --heads origin`): `refs/heads/development =
+  8e744db` (== local HEAD) and `refs/heads/main = 30d8d26` **untouched**. Working tree clean,
+  `origin/development` tracking ref repaired by hand (the sandbox blocked the post-push ref
+  write even though the push itself had succeeded — the remote was already correct, so
+  `git update-ref` was enough, no second push). `release/` stays untracked and the 50 MB
+  tarball is deliberately not in git. Shell scripts are `sh -n` clean; shellcheck reports three
+  **info**-level notes and no errors (SC2094 on the `sha256sums.txt` redirect, which the `find`
+  filter already excludes; two SC2015 `A && B || C` shapes in `install.sh`) — left as-is in this
+  commit rather than editing a verified installer without re-testing it.
