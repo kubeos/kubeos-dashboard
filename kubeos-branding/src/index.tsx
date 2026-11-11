@@ -17,6 +17,14 @@ import "./addnode";
 // The "Disks" page: LVM volume groups and thin pools, read from the ConfigMap the
 // node publishes. Imported for its side effect, like addnode above.
 import "./disks";
+// The "NFS" page: attaches an existing NFS export as a PersistentVolume. It
+// registers itself INSIDE Headlamp's Storage section (sidebar parent 'storage'),
+// because that is where a user looks for storage.
+import "./nfs";
+// Restart / Power off / Shell buttons in the top bar. Imported for its side
+// effect: it calls registerAppBarAction. They act on the NODE, so they belong in
+// the header rather than on a resource page.
+import "./nodeactions";
 import { kubeosTheme } from "./theme";
 
 /**
