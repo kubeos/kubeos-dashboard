@@ -151,9 +151,17 @@ the host. Consequences and workarounds:
 
 ## 4. The build → deploy loop that actually works
 
+**CORRECTION 2026-11-11: the host builds the plugin itself — the builder VM is not needed for the
+dashboard at all.** The line that used to sit here ("build on the builder VM, host has no toolchain
+wired up") was wrong when it was written and is wrong now: the host has `node v26.13.0`,
+`npm 12.2.1`, `pnpm 12.16.1`, `docker 26.1.5`, and `kubeos-branding/node_modules` already installed
+(843 MB). `cd kubeos-branding && npm run build` on the host produces `dist/main.js` and leaves
+`git status` **clean**, i.e. the committed bundle is byte-reproducible from the source. Use the
+host; only fall back to the builder if the host disk or node version ever gets in the way.
+
 ```sh
-# 1. edit plugin source, then build on the builder VM (host has no toolchain wired up)
-./vm.sh 'cd /root/kubeos-dashboard/kubeos-branding && npm run build'
+# 1. edit plugin source, then build it — on the HOST, not the builder
+( cd ~/kubeos-dashboard/kubeos-branding && npm run build )
 
 # 2. rebuild the image on the host, from the host repo
 DOCKER_CONFIG=/home/shaik/headlamp/_kubeos-dashboard/.docker \
@@ -679,6 +687,173 @@ or whatever the maintainer reports after clicking around.
 
 ## 6. Current live state
 
+**2026-11-11 17:41 — a real NFS test rig exists now (builder serves, node mounts).**
+
+- **Builder VM (`192.168.122.2`) is an NFS server**: `nfs-kernel-server` 1:2.8.3-1 installed,
+  exporting **`/srv/nfs/kubeos`** to `192.168.122.0/24` with
+  `rw,sync,no_subtree_check,no_root_squash` (root squash would stop most Pod images from writing;
+  the previous `/etc/exports` is saved as `/etc/exports.kubeos-backup`). `nfs-server` is enabled and
+  active, listening on 111 + 2049.
+- **Node `192.168.122.5` now has the NFS client** (`nfs-common` 1:2.8.3-1, `/usr/sbin/mount.nfs`).
+  How it got there matters: the installed KubeOS has **no plain `trixie main` apt repo** (only
+  security/updates/backports + docker/helm/k8s), so `nfs-common` had **no installation candidate**.
+  I added `deb https://deb.debian.org/debian/ trixie main` as a temporary
+  `/etc/apt/sources.list.d/kubeos-temp-test.list`, installed, then deleted the file again. **A
+  reinstall loses it** — the permanent fix is the ISO change already committed on the Platform side.
+  `rpcbind` came along as a dependency and is socket-active on 111.
+- **Verified at both levels, not just the object level:** OS mount of `192.168.122.2:/srv/nfs/kubeos`
+  (negotiated **v4.2**; node wrote a file the builder sees), and a real **Pod** with the exact shape
+  the dialog creates (`nfs-vers=4.1` mount options, RWX, Retain, pinned claim): PV/PVC `Bound`, Pod
+  `Succeeded`, running as `uid=100(headlamp)`, its file readable on the builder's disk. Test objects
+  were then deleted, so the NFS page starts from its empty state.
+- Files left on the export as proof: `written-by-builder.txt`, `written-by-node.txt`, `from-pod.txt`.
+- **Trap for anyone repeating this:** `mount -t nfs4 <server>:<path>` on the node initially failed with
+  `fsconfig() failed: NFS: mount program didn't pass remote address` — that is the message you get when
+  `mount.nfs` is **missing**, not a broken server. Check `command -v mount.nfs` first.
+
+
+**2026-11-11 17:35 — NEW: an "NFS" page inside Headlamp's own Storage section. Deployed and
+tested end to end.**
+
+- `kubeos-branding/src/nfs.tsx` (new, imported for its side effect by `index.tsx`). It registers
+  `registerSidebarEntry({ parent: 'storage', name: 'kubeos-storage-nfs', label: 'NFS', url:
+  '/kubeos-storage/nfs' })` — **`parent: 'storage'` is Headlamp's own Storage group**
+  (`frontend/src/components/Sidebar/useSidebarItems.tsx:310`), so NFS appears indented under Storage,
+  below Volume Attributes Classes, instead of becoming a second competing storage menu. Route:
+  `/c/main/kubeos-storage/nfs`.
+- **Why NFS at all:** the KubeOS local-path provisioner makes `hostPath` volumes — node-local, so
+  `ReadWriteOnce` only. NFS is the only way to a volume several Pods write at once, and it is the
+  Platform change made the same day (`nfs-common` + `/usr/share/kubeos/examples/nfs-static-pv.yaml`).
+  The page is the form for that example.
+- **What it does:** lists every PV with a `spec.nfs` source (name, `server:path`, capacity, access
+  mode, phase, claim, reclaim policy) and "Add NFS volume" creates, in dependency order, the
+  StorageClass `nfs-static` (only if absent), the PV, and optionally a PVC **pinned with `volumeName`**
+  so the binder cannot pick a different export.
+- **Deliberate safety decisions, all documented in the file's header:** the class is never the cluster
+  default (`local-path` must stay default so a claim naming no class keeps getting node-local storage);
+  `volumeBindingMode: Immediate` (an NFS volume is not node-bound, unlike local-path); reclaim defaults
+  to **`Retain`** so a mistyped claim can never delete an export's files; and there is **no delete
+  action** on this page — removal belongs on Storage → Persistent Volumes.
+- **Verified, not assumed** (headless Chromium + puppeteer): the page renders and the sidebar nests
+  correctly; the dialog fills and submits; the result was `StorageClass nfs-static exists · 1 NFS
+  volume · 1 bound` with the row `nfs-kubeos-test | 127.0.0.1:/export/kubeos-test | 20Gi |
+  ReadWriteMany | Bound | default/nfs-kubeos-test | Retain`; then all test objects were deleted again
+  and the node is back to `local-path (default)` + 0 PVs. Screenshots: `nfs-page.png` (empty state),
+  `nfs-dialog.png`, `nfs-created.png` (bound).
+- **Two tooling facts that cost time:** the `zenika/alpine-chrome:with-puppeteer` image **does** have
+  puppeteer, at `/usr/src/app/node_modules` — the earlier `MODULE_NOT_FOUND` was plain module
+  resolution, fixed with `-e NODE_PATH=/usr/src/app/node_modules -w /usr/src/app`; and the self-signed
+  node certificate must be accepted **at launch** (`acceptInsecureCerts: true` +
+  `--ignore-certificate-errors`), because `goto({ignoreHTTPSErrors})` does not cover the first
+  navigation and fails with `ERR_CERT_AUTHORITY_INVALID`.
+- **Pre-existing defect found, NOT fixed:** `npm run tsc` **fails at `HEAD` (`ed9ea86`)** with two
+  errors in `addnode.tsx` (337, 349): `setBundle({ ...info })` where `info` is `{endpoint, caHash}` but
+  the state is typed `JoinBundle` (which requires `token`). At runtime it is harmless — the token is
+  added later in `generate()` — so it is a stale type, not a bug, but it means the typecheck is not
+  usable as a gate. `nfs.tsx` itself typechecks clean. Worth splitting `ClusterInfo` from
+  `JoinBundle` in a small follow-up.
+- **The console errors on this deployment are Headlamp's, not the page's:** `401 GET
+  /clusters/main/me` (no login by design, `unsafeUseServiceAccountToken`) and 404s for API groups that
+  do not exist (`gateway.networking.k8s.io`, `scheduling.k8s.io` betas). No request from the NFS page
+  failed.
+
+
+**2026-11-11 16:32 — THE DASHBOARD IS DEPLOYED ON THE REAL NODE AND VERIFIED. `https://192.168.122.5:30443`**
+
+- Node `kubeos` (KubeOS Linux v1.0 Orhan, kernel 6.12.116, k8s v1.37.2, containerd 2.4.2) stays
+  `Ready`; **`kubectl get pods -A` shows exactly one pod and it is the dashboard** —
+  `kubeos-system/kubeos-dashboard-headlamp-7d7d8f7946-9m525`, `1/1 Running`, `0` restarts, pod IP
+  `10.244.0.3`, started 10:58:54Z. The host-native control plane means nothing else is a Pod.
+- **Deployed with the repo's own script**, `sh ~/headlamp/_kubeos-dashboard/install-dashboard.sh 192.168.122.5`
+  (images → chart+values → namespace + per-machine TLS secret → `helm upgrade --install` → rollout
+  → verify), exit 0 in one pass. Nothing was done by hand except the two RBAC notes below.
+- **Proof it is really the current code, not a stale image:** `GET /plugins/kubeos-branding/main.js`
+  returns **93,914 bytes** whose sha256 is `b1f76115a8c12cb8fec46e46680921942969e7c83c5f485b7bdabf5b5bda3062`,
+  byte-identical to `npm run build` of `HEAD` (`ed9ea86`) — `cmp` clean. `GET /` → **200**, 4618 bytes;
+  `/plugins/kubeos-branding/package.json` → 200.
+- **Visually verified** (headless Chromium, `dashboard.png` in this folder): MVZ-style **MFZ KUBEOS**
+  logo in lime, lime section highlight, the **Disks** section and **Join node** in the sidebar, and
+  real numbers on the rings (CPU 0.15/2, Memory 1.00/1.93 GB, Pods 1/1, Nodes 1/1 Ready) — so
+  **metrics-server is being read through the dashboard too**. `<title>` is still "Headlamp" in the
+  served HTML by design; the plugin rewrites it in the browser.
+- TLS is the per-machine self-signed cert minted on the node (`CN=kubeos-dashboard`, 825 days,
+  `notBefore Nov 11 10:58:52 2026`), as the values file requires. Browser warning expected.
+- **Two RBAC facts established here, both now written into `CLI_REQUIREMENTS.md` and `README.md`:**
+  1. **The chart creates `kubeos-dashboard-headlamp-admin` itself** (`clusterRoleBinding.create`
+     defaults to `true`, `clusterRoleName` defaults to `cluster-admin`). A hand-run
+     `kubectl create clusterrolebinding …` therefore failed with "already exists", and
+     `kubectl auth can-i list pods --as=system:serviceaccount:kubeos-system:kubeos-dashboard-headlamp`
+     answered `yes` with no manual step. The old README instruction (and CLI requirement) was wrong.
+  2. **`kubectl logs`/`exec` were Forbidden** — `nodes/proxy` for
+     `user=kube-apiserver-kubelet-client`. The node's `apiserver-kubelet-client.crt` has **no
+     organization**, so it is in no group; a throwaway `/tmp` probe proved **kubeadm v1.37.2 mints it
+     that way itself**, and `kubeadm init` (which the native path never runs) is what normally ships
+     the binding. Fixed on the node by hand for testing:
+     `kubectl create clusterrolebinding kubeos:apiserver-kubelet-client --clusterrole=system:kubelet-api-admin --user=kube-apiserver-kubelet-client`
+     — after it `exec` printed `EXEC-WORKS` and `logs` returned the headlamp JSON log lines.
+     **This is a KubeOS bug, not a dashboard bug** (`grep -rn 'nodes/proxy' config/` in the ISO tree
+     → nothing), and the exact object to add is in `CLI_REQUIREMENTS.md`.
+- **Node access works again:** SSH as `root@192.168.122.5` with `~/headlamp/_kubeos-dashboard/.vm_key`
+  (the user added the key at the console at 16:28). Both that key and `~/.ssh/id_ed25519` had been
+  refused before — a fresh install has no `authorized_keys`, the documented gap.
+- **OBSERVED 2026-11-11 17:06, after a node reboot: the dashboard container restarted once**
+  (`RESTARTS 1`). The node was busy booting — systemd units, the storage service and a test pod all
+  starting together — and the chart's **liveness** probe killed the container before its HTTPS server
+  answered. Nothing is broken, but this will look like a crash-loop to whoever watches the Pod page,
+  and the fix belongs in `deploy/values.yaml` when the dashboard ships in the ISO: raise
+  `livenessProbe.initialDelaySeconds` (or `failureThreshold`) so a cold, loaded boot cannot kill it.
+- **Screenshots:** the `zenika/alpine-chrome:with-puppeteer` image has **no `puppeteer` module
+  installed** (`MODULE_NOT_FOUND`), so the node-script recipe in §4 does **not** work; the entrypoint
+  is `tini --` and the binary is `/usr/bin/chromium-browser`. What works:
+  `docker run --rm --network host -v "$PWD":/shots zenika/alpine-chrome:with-puppeteer /usr/bin/chromium-browser --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --ignore-certificate-errors --hide-scrollbars --window-size=1600,1000 --virtual-time-budget=25000 --screenshot=/shots/dashboard.png https://192.168.122.5:30443/`
+  (harmless `ERROR: No matching issuer found` on stderr; the PNG is still written).
+
+**2026-11-11 16:20 (superseded by the block above) — nothing was deployed then, and the reason was access, not code:**
+
+- **The dashboard image is ALREADY current and needs no rebuild.** `main.js` inside
+  `ghcr.io/skmdab/headlamp:kubeos-0.1.0` has sha256
+  `b1f76115a8c12cb8fec46e46680921942969e7c83c5f485b7bdabf5b5bda3062`, and a fresh
+  `npm run build` of `HEAD` (`ed9ea86`) produces **exactly that hash** — image, plugin bundle and
+  committed source agree. (Before touching the image, check this hash; a rebuild that cannot change
+  the output is 20 minutes of noise.)
+- **The plugin now builds on the host** (see §4): `node v26.13.0` / `pnpm 12.16.1` / `docker 26.1.5`,
+  `node_modules` present, and the build leaves `git status` clean. **The builder VM is optional from
+  now on, not required.**
+- **Builder VM synced to `ed9ea86`** and clean, so §4's "keep both in sync" holds. It was on
+  `df5b4fa` with 4 modified files + 1 untracked. Before resetting, every differing file was diffed
+  against host `HEAD`: `addnode.tsx` was byte-identical, `index.tsx`/`CLI_REQUIREMENTS.md` were
+  strictly older (0 builder-only lines vs 3 and 60 host-only), and the builder's only unique content
+  was 7 lines of its own older session-B `MEMORY.md` text plus 10 lines of a stale `dist/main.js`
+  build. Nothing was lost; its former state is kept as a **stash** on the builder
+  (`git stash list` → "builder state before sync to host ed9ea86").
+- **Artifacts staged in `stage/`** (`~/headlamp/_kubeos-dashboard/stage/`): `kubeos-dashboard.tar.gz`
+  (112 MB, `docker save` of today's image) and `headlamp-0.46.0.tgz` (44 K, 118 entries, chart
+  `0.46.0`/`appVersion 0.46.0`). The **old** `../headlamp-0.46.0.tgz` from 2026-11-08 is **empty
+  garbage** (`tar tzf` → 0 entries) — do not reuse it.
+- **Node `192.168.122.5` refuses BOTH keys** (`~/headlamp/_kubeos-dashboard/.vm_key` and
+  `~/.ssh/id_ed25519`): `Permission denied (publickey,password)`. Its API answers on `:6443`
+  (`403`, i.e. alive), `:30443` refuses (`000`, nothing deployed). Cause is the known fresh-install
+  gap — nothing in the ISO creates `/root/.ssh/authorized_keys` — not PermitRootLogin (Debian
+  defaults to `prohibit-password`, which allows keys).
+- **`~/headlamp/_kubeos-dashboard/admin.conf` is useless here:** it points at the **old** `.4` node
+  and carries that install's CA (`notBefore Nov 7 2026`), while `.5` minted a brand-new PKI at its own
+  first boot. Do not try to reach `.5` with it.
+- **The deploy tooling already exists and is idempotent** — `redeploy.sh` (build → image → `ctr import`
+  on every node → `install-dashboard.sh`) and `install-dashboard.sh` (both images, chart + values,
+  namespace + per-machine TLS cert, `helm upgrade --install`, rollout restart, verify). `install-dashboard.sh`
+  **mints `kubeos-system/kubeos-dashboard-tls` itself** with `openssl` on the node, which is why the
+  ISO not doing it has not blocked testing — but that is a manual workaround under this repo's §6 and
+  stays listed in `CLI_REQUIREMENTS.md`.
+- **Gap to expect on a fresh node:** `install-dashboard.sh` creates the namespace, the TLS secret and
+  the release, but **not** the service-account binding, so the UI loads with empty lists behind 403s
+  until `kubectl create clusterrolebinding kubeos-dashboard-headlamp-admin …` runs. That is
+  `CLI_REQUIREMENTS.md` item "Dashboard service account has no permissions on a fresh install" —
+  it is the CLI's job, and running it by hand here is the §6 temporary workaround.
+- **`libvirtd` is wedged on the host** after `virsh dumpxml kubeos` hung this session: `virsh list`
+  still answers, but `domstate`/`dumpxml` return nothing. The console route into the node is therefore
+  closed until `sudo systemctl restart libvirtd`. Do not hammer it; one stuck `virsh` per keystroke is
+  what wedges it (lessons log, 2026-11-09).
+
 **2026-11-08 18:10 — fresh ISO install + hand-deployed dashboard (session C; supersedes the block
 below):**
 
@@ -815,6 +990,26 @@ below):**
   and re-seat the neighbouring blocks **together** (Storage row, Storage list, Disks row,
   Disks list) instead of moving one node at a time. Reloading a URL hides both bugs;
   verifying by *clicking* the sidebar exposes them.
+- **Top-bar actions**: `registerAppBarAction(Component)` drops a component into Headlamp's
+  own top bar; `TopBar` is mounted at `components/App/Layout.tsx:349` inside `AppContainer`'s
+  `BrowserRouter`/`HashRouter`, so router hooks (`useHistory`, links) are legal there.
+- **`?view=exec&container=<c>` is a trap on v0.46.0.** The deep link crashes the Pod page
+  ("Uh-oh! Something went wrong.") with React #185, *maximum update depth exceeded*:
+  `PodDetails` auto-launches the terminal from a `useEffect` guarded by a `useRef`, the
+  `Activity` takes over the screen, the route remounts, the ref is fresh again, and it
+  launches for ever. The same terminal from the Pod page's own "Terminal / Exec" button
+  works, which is what isolates it to that effect. Launch an `Activity` yourself instead.
+- **What a plugin can and cannot import from the library**: `Activity` and `K8s` are
+  exported from the package root; **`Terminal` is not** — reach it as
+  `CommonComponents.Terminal` (props `{item: Pod, isAttach?, noDialog?, onClose?}`, and
+  `noDialog` is what makes it render inline inside an activity).
+- **`@mui/icons-material` cannot be used in a plugin at all.** The icons call
+  `createSvgIcon` from `@mui/material/utils`, and the plugin loader externalises
+  `@mui/material` to `pluginLib.MuiMaterial` without a `utils` submodule, so the bundle
+  throws `Cannot read properties of undefined (reading 'createSvgIcon')` while registering
+  — and the failure takes the **whole plugin** with it (every KubeOS page and every custom
+  sidebar entry silently disappears; the only sign is one console error). Text labels or
+  inline `<svg>`, never MUI icons.
 
 ## 9. Mistakes made before, don't repeat
 
@@ -838,3 +1033,95 @@ below):**
 - `/home/shaik/headlamp` — upstream Headlamp clone (source of truth for behaviour).
 - `/home/shaik/KubeOS` — the KubeOS ISO/CLI tree. **Never edited from this project**;
   work needed there is handed over as a prompt (AGENTS.md §11).
+
+**2026-11-11 17:44 — "where is the mountpoint?" answered on the live node.** The NFS volume
+`nfs-kubeos` (2Gi, RWX, `nfs-static`) is `Bound` to claim `default/nfs-kubeos`, but **nothing was
+mounted anywhere** until a Pod consumed the claim: an NFS PV is mounted *inside the Pod*, never on the
+node's own filesystem, so `ls` on the node finds nothing. A helper Pod **`default/nfs-explorer`** was
+started (image `ghcr.io/skmdab/headlamp:kubeos-0.1.0`, which is already on the node and has `/bin/sh`,
+mounted at `/data`, `sleep infinity`) so the contents can be browsed from the dashboard's pod
+**Terminal** or with `kubectl exec`. It mounted as `vers=4.1` — the class's pinned mount options — and
+showed the three proof files; the same directory on the builder (`/srv/nfs/kubeos`) lists them too.
+Delete it with `kubectl delete pod nfs-explorer` when done. Worth remembering for the product: Headlamp
+has no file browser, so browsing a volume means a Pod plus exec — a "Browse volume" action on the NFS
+page (running `ls` through exec) would be a real feature, not a workaround.
+
+**2026-11-11 17:52 — unmount actions added to the NFS page (user: "if i wanted to unmount from dashboard?").**
+Each row now has two buttons, and neither can delete files on the export (the Kubernetes API has no
+such operation for NFS):
+- **Detach** — releases the claim (`DELETE .../persistentvolumeclaims/<name>`). It **refuses while a
+  Pod mounts that claim** and names the Pod(s) — measured: "Still mounted by default/nfs-explorer
+  (Running)", submit disabled, because releasing a claim under a running Pod leaves it mounting a
+  volume that no longer exists for it.
+- **Remove** — deletes the PV object and requires the volume name typed out. Blocked while a claim
+  still exists.
+- **Bug found by testing, and it is the interesting one:** after a detach, the PV keeps
+  `spec.claimRef` (that is normal for a released PV), so my first version treated "claimRef set" as
+  "claim exists" and **blocked Remove on an already-released volume for ever**. Fixed by resolving
+  claim existence from one extra `GET /api/v1/persistentvolumeclaims` per load; the row now reads
+  `default/x (released)` and Detach is disabled when the claim is gone (`claimExists` on `NfsVolume`).
+- Verified end to end through the UI on a throwaway volume (`nfs-removetest`): guard blocked the
+  in-use volume, Detach released the idle one, Remove deleted the PV — and afterwards
+  `ls /srv/nfs/kubeos` on the builder still showed all three files. Screenshots: `nfs-actions.png`,
+  `nfs-detach-blocked.png`, `nfs-remove-confirm.png`, `nfs-after-remove.png`.
+- The user's own volume `nfs-kubeos` was deliberately left untouched (still `Bound`), and the helper
+  Pod **`default/nfs-explorer` is still running and still mounts it** — so Detach on it stays blocked
+  until that Pod is deleted.
+
+### Session 2026-11-11 (evening) — top-bar node controls: Restart, Power off, Shell
+
+User: *"i want add restart poweroff and shell buttons for node on top right side"*. New file
+`kubeos-branding/src/nodeactions.tsx` (~490 lines) + `import "./nodeactions";` in `index.tsx`;
+`registerAppBarAction` appends to Headlamp's own top bar (rendered inside the router, see §8).
+Measured header order: `Restart`, `Power off` (amber), `Shell`.
+
+- **Restart / Power off** create a one-shot privileged Pod in `kubeos-system`
+  (`nodeSelector` on the hostname, `hostPID`, host `/` at `/host`, image
+  `ghcr.io/skmdab/kubeos-join-helper:0.1.0`) that runs
+  `nsenter -t 1 -m -u -i -n -p -- /usr/bin/systemctl reboot|poweroff` with
+  `chroot /host /usr/bin/systemctl …` as fallback, writing
+  `/var/lib/kubeos/.kubeos-<action>-$POD_NAME` before the request. **Bare Pod with
+  `restartPolicy: Never`, not a Job** — a Job is re-created after the node dies and would
+  reboot for ever. Power off needs the node name typed; Restart is a plain confirm.
+- **Shell** ensures `kubeos-node-shell` (privileged, `hostPID`, `/host`,
+  `activeDeadlineSeconds: 3600`, deleted on terminal close) and opens a full-screen
+  `Activity` with `CommonComponents.Terminal`, plus a hint line naming the `nsenter`
+  command for the host.
+- **Verified end to end with puppeteer** (`_kubeos-dashboard/node-actions-test.js`):
+  header shows all three buttons; the Power off confirm stays disabled with no name and
+  with a wrong name; the Shell terminal accepted
+  `echo KUBEOS-SHELL-OK && hostname && head -1 /host/etc/hostname` and printed
+  `KUBEOS-SHELL-OK` / `kubeos-node-shell` / `kubeos` (so `/host` really is the node);
+  0 page errors. The Pod spec was read back from the API:
+  `activeDeadlineSeconds=3600 restart=Always privileged=true` with the join-helper image.
+- **The shutdown mechanism was proven without rebooting** using a probe Pod with the
+  identical spec but the read-only verb `systemctl is-system-running`: `nsenter` → `running`,
+  `chroot /host` → `running`, host `uptime` readable, `/var/lib/kubeos` writable. The
+  literal `reboot`/`poweroff` verb is still unexercised — offered to the user, and it costs
+  one click.
+- No RBAC was added: the chart already binds the dashboard SA to `cluster-admin`
+  (`kubeos-dashboard-headlamp-admin`).
+- Deployed with `_kubeos-dashboard/redeploy.sh` (plugin build → image → containerd import →
+  `helm upgrade`); bundle `dist/main.js` 119,621 B, sha256 `730c3ab1…`.
+
+- **`systemctl restart` is not "restart the machine".** The node-actions Restart button built its
+  command as `systemctl ${action}` while the action was called `restart` in the UI, so the Pod ran
+  `systemctl restart` with no unit, printed `Too few arguments.` twice (nsenter attempt + chroot
+  fallback) and exited 2 — and the node stayed up, which looks exactly like a button that "does
+  nothing". The systemd verb for a machine reboot is **`reboot`**; `restart` takes a unit. The fix is
+  an explicit `action === "restart" ? "reboot" : "poweroff"`, but the lesson is broader: the
+  read-only mechanism probe (`systemctl is-system-running`) passes in both worlds and could never
+  catch a wrong verb, so **every privileged action needs one real end-to-end firing** before it is
+  called done. Measured after the fix: confirm → node down in 7 s → kernel start → `Ready=True`
+  ~10 s after kernel start, 9/9 units active, dashboard back on 200, and the action Pod went
+  `Unknown` and was never re-created (the reason it is a bare `restartPolicy: Never` Pod, not a Job).
+
+- **A disabled field looks like a broken field.** The NFS page's *Remove volume* dialog rendered
+  `Type <name> to confirm` with `disabled={claimBlocksRemoval}` while a claim still pointed at the PV.
+  The rule was right (removal is refused anyway) but the user clicked, nothing happened, and reported
+  "the insert fields are not editable" with a screenshot. Fixed 2026-11-11: when the action is blocked
+  the field is not rendered; the dialog explains why and offers **Detach claim instead**, which swaps
+  the same dialog to the Detach flow. Rule to keep: **never render a control that can never be used** —
+  say why and put the unblocking action next to it. Verification detail worth keeping: the NFS table is
+  a div grid (no `<tr>`), so a browser test locates a row by the innermost `div` that carries the
+  volume name and exactly two buttons.

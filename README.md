@@ -73,6 +73,43 @@ usage. See `deploy/metrics-server/` for the pinned metrics-server, why it needs
 kubectl apply -f deploy/metrics-server/components.yaml
 ```
 
+## Node controls (top bar)
+
+Three buttons sit in Headlamp's top bar, left of the settings and user icons:
+**Restart**, **Power off** and **Shell**. They act on the node, not on a resource, so
+they are reachable from every page.
+
+A dashboard Pod cannot touch the host's systemd, so each control creates a short-lived
+**privileged Pod** in `kubeos-system` — pinned to the node by `nodeSelector`, `hostPID`,
+the host's `/` mounted at `/host`, image `ghcr.io/skmdab/kubeos-join-helper:0.1.0`
+(already on every KubeOS node, so this works offline) — and that Pod asks the host's own
+systemd:
+
+```sh
+nsenter -t 1 -m -u -i -n -p -- /usr/bin/systemctl reboot    # or poweroff
+chroot /host /usr/bin/systemctl reboot                      # fallback
+```
+
+Safety, deliberately chosen:
+
+- **A bare Pod with `restartPolicy: Never`, never a Job.** A Job whose Pod dies with the
+  node is re-created by the controller and would reboot the node for ever.
+- An idempotency marker under `/var/lib/kubeos` is written *before* the request, so the
+  same Pod can never fire a shutdown twice.
+- **Power off requires the node's name typed** into the dialog; Restart is a plain
+  confirmation. Power off leaves the machine dark until someone is physically at it.
+- The shell Pod (`kubeos-system/kubeos-node-shell`) is privileged and mounts the host's
+  root filesystem, so it does not stay: it is deleted when the terminal is closed and in
+  any case expires after an hour (`activeDeadlineSeconds`). Its header line states what
+  the shell is — a privileged container, with `nsenter -t 1 -m -u -i -n -p -- /bin/bash`
+  for the node's own shell.
+
+`?view=exec&container=<c>` deep links are **not** used for the shell: on Headlamp
+v0.46.0 they crash the page (React "maximum update depth exceeded") because `PodDetails`
+auto-launches the terminal from an effect whose guard resets when the activity takes over
+the screen. The button calls `Activity.launch()` with `CommonComponents.Terminal`
+directly, the same path the Pod page's own "Terminal / Exec" button takes.
+
 ## Authentication
 
 `config.unsafeUseServiceAccountToken: true` in `deploy/values.yaml` makes
@@ -80,8 +117,18 @@ kubectl apply -f deploy/metrics-server/components.yaml
 opens without a login prompt.
 
 The service account name is the pod's, not a guess: the chart names it after the
-release, `kubeos-dashboard-headlamp`. It needs a binding or the UI loads normally
-and every list is empty behind 403s:
+release, `kubeos-dashboard-headlamp`.
+
+**The binding is created by the chart itself — do not add it by hand.** Upstream's
+`templates/clusterrolebinding.yaml` is gated on `clusterRoleBinding.create`, whose
+default is `true`, and binds `clusterRoleName` (default `cluster-admin`) to that
+service account. This was verified on a live node on 2026-11-11: after
+`helm upgrade --install`, the object `kubeos-dashboard-headlamp-admin` exists with
+`.metadata.managedFields[].manager == helm` and `subjects: kubeos-dashboard-headlamp`,
+and `kubectl auth can-i list pods --as=system:serviceaccount:kubeos-system:kubeos-dashboard-headlamp`
+answers **yes** with no manual step. The command below is therefore only for a
+deployment that explicitly sets `clusterRoleBinding.create: false`, or for repairing
+a cluster where someone deleted the object:
 
 ```sh
 kubectl create clusterrolebinding kubeos-dashboard-headlamp-admin \
@@ -92,7 +139,8 @@ kubectl create clusterrolebinding kubeos-dashboard-headlamp-admin \
 **`cluster-admin` is a development shortcut.** Before this goes into an ISO the
 binding must become a scoped `Role`/`ClusterRole` -- read on the KubeOS namespaces
 plus logs and events is what a dashboard actually needs -- because whatever it is
-granted, everyone who can reach port 30443 gets without authenticating.
+granted, everyone who can reach port 30443 gets without authenticating. Setting
+`clusterRoleBinding.clusterRoleName` is the supported knob for that; keep `create: true`.
 
 ## Known limits
 

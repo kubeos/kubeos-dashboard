@@ -9,6 +9,23 @@ KubeOS install does none of it.
 
 ## Open
 
+### top-bar node controls (Restart / Power off / Shell): needs NOTHING new from the CLI
+- **Dashboard feature affected:** the three buttons in Headlamp's top bar.
+- **What it needs from the node, and why it already has it:** the controls run as a
+  privileged Pod in `kubeos-system`, so they need (a) `create pods` in that namespace —
+  the chart already binds the dashboard SA to `cluster-admin`
+  (`kubeos-dashboard-headlamp-admin`), (b) the join-helper image
+  `ghcr.io/skmdab/kubeos-join-helper:0.1.0` in the node's containerd — **the same image the
+  Join node page already requires** and which the ISO installs (see the join-helper item
+  below), and (c) working `pods/exec` for the terminal — that is the `nodes/proxy` item
+  further down, which is still **open** and is why the Shell button is worth nothing on a
+  fresh install until it lands.
+- **Verified on the test VM:** yes, 2026-11-11 18:15 — PowerShell-equivalent flow through
+  puppeteer, with the shutdown verb replaced by a read-only `systemctl is-system-running`
+  probe (see `MEMORY.md`, session 2026-11-11 evening).
+- **What KubeOS should add, if anything:** nothing for the buttons themselves. The
+  `nodes/proxy` ClusterRoleBinding remains the one real prerequisite.
+
 ### metrics-server: there is no source for CPU and memory usage
 - **Dashboard feature affected:** Overview page -- the CPU and Memory cards (also
   `kubectl top`).
@@ -37,7 +54,75 @@ KubeOS install does none of it.
   has no registry access:
   `docker save registry.k8s.io/metrics-server/metrics-server:v0.8.0 | gzip -1 | ssh root@<node> 'ctr -n k8s.io images import -'`
 
-### Dashboard service account has no permissions on a fresh install
+### ~~Dashboard service account has no permissions on a fresh install~~ — WITHDRAWN 2026-11-11, the chart does this itself
+
+> **Verified on a live node (`192.168.122.5`, fresh install, 2026-11-11):** this requirement was
+> based on a wrong premise. The Headlamp chart **creates the binding itself**:
+> `charts/headlamp/templates/clusterrolebinding.yaml` is gated on `clusterRoleBinding.create`, which
+> defaults to **`true`**, and binds `clusterRoleBinding.clusterRoleName` (default **`cluster-admin`**)
+> to the release's service account. After `helm upgrade --install` the object
+> `kubeos-dashboard-headlamp-admin` exists with `.metadata.managedFields[].manager == helm` and
+> `subjects: kubeos-dashboard-headlamp`, and
+> `kubectl auth can-i list pods --as=system:serviceaccount:kubeos-system:kubeos-dashboard-headlamp`
+> answered **`yes` with no manual step** (a hand-run `kubectl create` failed with "already exists",
+> which is what exposed this). Every page listed real objects immediately.
+>
+> **What the CLI still owes us is not the binding but the choice of role:** `cluster-admin` is the
+> chart's default and is a development shortcut for an appliance. The supported knob is
+> `clusterRoleBinding.clusterRoleName` in `deploy/values.yaml` — set it to a scoped ClusterRole and
+> keep `create: true`. The create/delete dialogs (Volume Group, Thinpool, Disks) need `create`/`delete`
+> on `jobs` in `kubeos-system` and on LVM-adjacent permissions, so it is not read-only.
+> Nothing to verify beyond what is above; re-open only if a deployment sets `clusterRoleBinding.create: false`.
+
+### `kubectl logs` / `exec` (and the dashboard's Logs + Exec pages) are Forbidden on a native-path node
+
+- **Dashboard feature affected:** **Logs** and **Exec** on every workload page, plus anything else
+  that proxies through the API server's kubelet connection; the shell/terminal tab shows
+  `Forbidden` instead of output.
+- **Symptom seen (2026-11-11, `192.168.122.5`):**
+  `kubectl exec …` → `error: unable to upgrade connection: Forbidden (user=kube-apiserver-kubelet-client,
+  verb=create, resource=nodes, subresource(s)=[proxy])`. `kubectl logs` fails the same way. It is not a
+  dashboard bug — it happens on the CLI too.
+- **Root cause (measured, not guessed):** the API server authenticates to kubelet with
+  `/etc/kubernetes/pki/apiserver-kubelet-client.crt`, whose subject on this node is
+  `CN=kube-apiserver-kubelet-client` with **no organization**, so it is in **no group** and every
+  `nodes/proxy` call is RBAC-checked. A throwaway probe proved the cert is not our doing: `kubeadm init
+  phase certs ca` + `phase certs apiserver-kubelet-client` in `/tmp` on kubeadm **v1.37.2** mints the
+  same group-less subject. On a stock `kubeadm init` cluster this still works because `kubeadm init`
+  ships the binding itself; the KubeOS native path never runs `kubeadm init`, so **nobody creates it**.
+  `grep -rn 'nodes/proxy' config/` in the KubeOS tree returns **nothing** — the gap is a missing
+  binding, not a missing flag.
+- **What the CLI must add or change:** one KubeOS-owned object, in
+  `usr/share/kubeos/manifests/native-services.yaml` next to the other bindings:
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: kubeos:apiserver-kubelet-client
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:kubelet-api-admin      # ships with the apiserver; nodes/proxy,log,metrics,stats
+  subjects:
+    - kind: User
+      name: kube-apiserver-kubelet-client
+      apiGroup: rbac.authorization.k8s.io
+  ```
+
+  `system:kubelet-api-admin` already exists in every cluster (it is created by kube-apiserver) and
+  grants exactly `nodes/proxy`, `nodes/log`, `nodes/metrics`, `nodes/stats` — verified on the node.
+- **Where it should run:** applied at first boot with the rest of `native-services.yaml`, before or
+  alongside the other bindings; it must not be able to fail first boot.
+- **How to verify it works:** `kubectl -n kubeos-system exec deploy/<anything> -- echo ok` prints
+  `ok`, `kubectl logs deploy/<anything>` prints log lines, and the dashboard's Logs tab shows output
+  instead of `Forbidden`.
+- **Temporary workaround used for testing (if any):** yes, applied by hand on the test node:
+  `kubectl create clusterrolebinding kubeos:apiserver-kubelet-client --clusterrole=system:kubelet-api-admin --user=kube-apiserver-kubelet-client`
+  — after it, `exec` and `logs` both work. Delete with `kubectl delete clusterrolebinding kubeos:apiserver-kubelet-client`
+  once the ISO carries it.
+
+### The dashboard service-account binding is the chart's job (kept for history)
 - **Dashboard feature affected:** every page of the dashboard, as soon as it is
   deployed with `unsafeUseServiceAccountToken: true` (which is how it is configured
   now, so that nobody has to paste a token).
@@ -122,6 +207,36 @@ KubeOS install does none of it.
   (`cli-check`), used to observe `FailedBinding` and to confirm the dashboard renders a
   PVC correctly; both were deleted afterwards
   (`kubectl delete namespace kubeos-storage-test`). Nothing is left on the node.
+- **STATUS 2026-11-11 — implemented on the KubeOS side, as a host service, not a Pod.**
+  The maintainer rejected a container-image provisioner ("don't want busybox"), so KubeOS
+  now ships `kubeos-storage-provisioner` (a systemd unit that creates the directory on the
+  pod-data LV and a pre-bound PV) plus a default `local-path` StorageClass with
+  `kubeos.io/local` as its provisioner. Verified on the node: claim `Bound` in 6 s, data
+  readable from the host, PV + directory reclaimed on deletion, and it survives a reboot.
+  **This item stays open until an ISO carries it** — the running VM has it hand-installed.
+  What the dashboard should expect once it does: `kubectl get sc` shows `local-path
+  (default)`, the Storage pages list the class and any claim, and a claim still stays
+  `Pending` until something consumes it (`WaitForFirstConsumer`, correct for local
+  volumes).
+
+### NFS: the node must be able to mount an export at all
+
+- **Dashboard feature affected:** the new **Storage → NFS** page (attach an existing NFS export as a
+  PersistentVolume). Nothing on that page can work if the node has no NFS client.
+- **Symptom seen:** a PV of type `nfs` never mounts, so any Pod claiming it hangs in `ContainerCreating`
+  with a wrong-fs-type / `mount.nfs: not found` style error, and the dashboard can do nothing about it.
+- **What the CLI must add or change:** the **client** package only — `nfs-common` (trixie
+  `1:2.8.3-1`, ships `/usr/sbin/mount.nfs`). Note it Depends on `rpcbind`, which Debian
+  socket-activates on port 111; only NFSv3 needs it, so a v4-only node may disable
+  `rpcbind.socket`. KubeOS ships **no NFS server and no NFS provisioner**: the dashboard creates
+  static PVs against an export the operator already runs.
+- **Where it should run:** in the installed image (package list), not at first boot.
+- **How to verify it works:** on a fresh node, `command -v mount.nfs` prints a path; then create a
+  volume from the dashboard's Storage → NFS page and `kubectl get pv` shows it `Available`/`Bound`.
+- **STATUS 2026-11-11:** `nfs-common` was added to the KubeOS package list and a documented static
+  example (`/usr/share/kubeos/examples/nfs-static-pv.yaml`) ships in the tree — **open until an ISO
+  carries it**. The running test VM does not have it, so the dashboard page was verified against the
+  API (objects created and bound) but **not** against a real mount.
 
 ### multi-node: every KubeOS install becomes its own one-node cluster
 - **Dashboard feature affected:** there is no "add node" anywhere in the dashboard --
