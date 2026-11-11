@@ -1,0 +1,41 @@
+[Unit]
+Description=KubeOS dashboard (Headlamp server)
+Documentation=https://github.com/skmdab/kubeos-dashboard
+# The dashboard proxies the API server directly, so it is useless before the API answers.
+# `After=` does not mean "serving", so the server retries on its own and Restart=always
+# covers the startup window; node-ready is what waits for a real answer.
+After=kube-apiserver.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/kubeos-dashboard/kubeconfig
+ConditionPathExists=/etc/kubeos-dashboard/tls.crt
+
+[Service]
+Type=simple
+User=kubeos-dashboard
+Group=kubeos-dashboard
+# headlamp-server writes its own kubeconfig cache under $HOME/.config/Headlamp
+Environment=HOME=/var/lib/kubeos-dashboard
+WorkingDirectory=/var/lib/kubeos-dashboard
+EnvironmentFile=/etc/default/kubeos-dashboard
+ExecStart=/usr/lib/kubeos-dashboard/headlamp-server $HEADLAMP_ARGS
+Restart=always
+RestartSec=3
+
+# Hardening. The server needs to read its own configuration and write only its state
+# directory; it listens on a high port, so no capability is needed. ProtectSystem=strict
+# makes everything read-only except the paths listed in ReadWritePaths.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/kubeos-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -12,3 +12,7 @@ node_modules/
 # screenshots taken to verify a change against the live cluster; evidence for a
 # conversation, not part of the product
 .shots/
+
+# assemble-binary output (deploy/binary/build-binary.sh); the plugin bundle inside
+# kubeos-branding/dist IS tracked, this is the release tarball area
+/release/
