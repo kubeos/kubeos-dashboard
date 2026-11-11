@@ -1293,3 +1293,15 @@ Repository size: 1.3 MB of our own code + 52 MB vendored. First push of `vendor/
 is ~3.7k lines of the KubeOS-specific pages (`disks`, `nfs`, `nodeactions`, `addnode`, theme/brand).
 Removing Headlamp entirely is option C — 3-6 weeks and owning security maintenance — explicitly not
 taken.
+
+**Found and fixed immediately after the push: the stale-plugin warning was mtime-based and lied in a
+fresh clone.** `build-binary.sh` warned whenever `kubeos-branding/src/*.tsx` was newer than
+`dist/main.js` — but **git gives every file the checkout time**, so in a fresh clone (exactly the
+situation vendoring is for) `src` can look newer than `dist` and every clean build printed "the release
+would ship an old plugin". Found by cloning the pushed repo to `/tmp/kd-clone` and building it, which is
+the only test that reproduces a stranger's first run. Fixed with `plugin_is_stale()`: ask git (uncommitted
+edits under `kubeos-branding/src`, else the last commit that touched `src` vs the last one that touched
+`dist`), and keep the mtime comparison only as a fallback for a non-git tree. Verified both ways in the
+clone: clean tree → **no** warning; one appended line in `src/theme.ts` → warning, then restored.
+Standing lesson: **a build check based on file mtimes is not valid in a fresh checkout** — mtimes describe
+the clone, not the history.

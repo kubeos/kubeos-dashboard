@@ -115,9 +115,24 @@ fetch_layer() { # fetch_layer <digest> <file>
 
 # ---- inputs -------------------------------------------------------------
 [ -s "$PLUGIN_DIST/main.js" ] || die "no plugin bundle at $PLUGIN_DIST/main.js - run: cd kubeos-branding && npm run build"
-if [ -n "$(find "$REPO/kubeos-branding/src" -newer "$PLUGIN_DIST/main.js" -name '*.tsx' -o -newer "$PLUGIN_DIST/main.js" -name '*.ts' 2>/dev/null | head -1)" ]; then
+
+# Is dist/main.js older than src/? mtimes cannot answer that: git gives every file the
+# checkout time, so in a fresh clone src/*.tsx can look "newer" than dist and the mtime
+# test produced a false warning (found by cloning this repo and building it). Ask git,
+# and keep the mtime comparison only for a tree that is not a git checkout.
+plugin_is_stale() {
+    if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+        # Uncommitted edits under src/ are the common case.
+        [ -n "$(git -C "$REPO" status --porcelain -- kubeos-branding/src 2>/dev/null)" ] && return 0
+        src_t=$(git -C "$REPO" log -1 --format=%ct -- kubeos-branding/src 2>/dev/null || true)
+        dist_t=$(git -C "$REPO" log -1 --format=%ct -- kubeos-branding/dist 2>/dev/null || true)
+        [ "${src_t:-0}" -gt "${dist_t:-0}" ] && return 0
+        return 1
+    fi
+    [ -n "$(find "$REPO/kubeos-branding/src" \( -name '*.tsx' -o -name '*.ts' \) -newer "$PLUGIN_DIST/main.js" 2>/dev/null | head -1)" ]
+}
+plugin_is_stale &&
     log "WARNING: kubeos-branding/src is newer than dist/main.js - the release would ship an old plugin"
-fi
 VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/kubeos-branding/package.json" | head -1)
 [ -n "$VERSION" ] || die "cannot read the plugin version from kubeos-branding/package.json"
 NAME=kubeos-dashboard-${VERSION}-linux-amd64
