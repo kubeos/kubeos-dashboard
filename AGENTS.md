@@ -9,11 +9,10 @@ If a rule here conflicts with what you were about to do, the rule wins. If you a
 The cross-project card `~/KubeOS/RESUME.md` is the single entry point for the whole KubeOS effort —
 read it too when the work touches both the ISO tree and the dashboard.
 
-**End of every work item:** update `MEMORY.md` (append a dated session block; refresh the open-items
-list) so a session that dies mid-thought costs nothing. The user's standing instruction
-(2026-11-10): *"when I open a new session I need to explain from starting, it is very frustrating
-every time"*. A session can end without warning — context limit, closed window, dead network — and
-the next one must be able to continue from files, not from the user's memory.
+**After every finished piece of work — immediately, not batched to the end of the session:** append
+a dated block to `MEMORY.md` (what changed, what was verified, what is left) and refresh the open
+items. The user's standing instruction (2026-11-11): *"update everytime what you done"*. The point is
+that a session which dies at any second leaves a memory file that is already true.
 
 - The transcript of every session is kept in `~/.dsh/sessions/<workspace>/<session-id>/`; the same
   session can be reopened from the GUI's **Sessions** list, which keeps full context. That is the
