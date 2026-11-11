@@ -1305,3 +1305,46 @@ edits under `kubeos-branding/src`, else the last commit that touched `src` vs th
 clone: clean tree → **no** warning; one appended line in `src/theme.ts` → warning, then restored.
 Standing lesson: **a build check based on file mtimes is not valid in a fresh checkout** — mtimes describe
 the clone, not the history.
+
+### Session 2026-11-11 (night, cont.) — `~/headlamp` deleted; keepers moved to `~/.kubeos-vm`
+
+User: *"ok so what about headlamp in my ~/ is it not needed now right.?"* — right, for building and
+running: nothing in this repo referenced the clone (grepped the scripts, `package.json`,
+`scripts/*.mjs`), the plugin builds against `@kinvolk/headlamp-plugin` from npm, and the upstream
+binaries are vendored. **But the folder was 2.0 GB of which only ~24 MB mattered, and that 24 MB was
+not Headlamp at all**, so it was rescued before anything was deleted:
+
+```
+~/.kubeos-vm/          29 MB total now
+  .vm_key (600)        the ONLY SSH key to the node (192.168.122.5) and builder (192.168.122.2)
+  admin.conf           cluster admin kubeconfig
+  harness/             44 files: up.sh, vm.sh, node.sh (start the VMs), redeploy.sh,
+                       install-dashboard.sh, and every browser-test script (*.js)
+  shots/               83 verification screenshots
+  brand/               _brand-preview (mark/wordmark PNGs - the logo source material)
+```
+
+`KUBEOS-DASHBOARD-NOTES.md` moved into this repo as `docs/headlamp-survey.md` (with a header saying
+it is the historical record), and the three references to the old location were fixed in
+`~/KubeOS/AGENTS.md` §8 and `~/KubeOS/MEMORY.md`/`RESUME.md` (dated work-log entries left as history).
+The two legacy container-path scripts (`install-dashboard.sh`, `redeploy.sh`) got a **LEGACY** header
+pointing at `deploy/binary/`.
+
+Deleted: `~/headlamp` (2.0 GB → 0). Its bulk was our own junk, not upstream: a stale copy of
+`kubeos-branding` (830 MB), `.npm-cache` (722 MB), old Helm staging + a stale release tarball
+(224 MB), Firefox/Chrome automation profiles (64 MB); the upstream clone itself was 134 MB and is
+re-creatable with `git clone --depth 1`.
+
+**Two things verified rather than assumed:**
+1. **The plugin build does not need the clone**: `npm run build` in `kubeos-branding` after the
+   deletion produced `dist/main.js` = 120,118 B, sha256 `47c57859…` — **byte-identical** to what
+   shipped, so the toolchain and the bundle are unaffected.
+2. **Access from the new paths works before deleting**: SSH from `~/.kubeos-vm/.vm_key` to both the
+   node (`kubeos`, service `active`) and the builder (`builder`) succeeded *before* `rm -rf`.
+
+**One false alarm, worth remembering:** the pre-delete symlink check
+(`find … -type l -lname '*headlamp*'`) matched two entries inside
+`kubeos-branding/node_modules/.bin/` — but those are *relative* symlinks
+(`../@kinvolk/headlamp-plugin/bin/…`) whose **names** happen to contain "headlamp"; nothing pointed
+into `~/headlamp`. Lesson: match the symlink **target**, not the name, e.g.
+`find … -type l -exec sh -c 'readlink -f "$1" | grep -q /headlamp/' _ {} \;`.
