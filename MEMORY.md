@@ -1348,3 +1348,29 @@ re-creatable with `git clone --depth 1`.
 (`../@kinvolk/headlamp-plugin/bin/…`) whose **names** happen to contain "headlamp"; nothing pointed
 into `~/headlamp`. Lesson: match the symlink **target**, not the name, e.g.
 `find … -type l -exec sh -c 'readlink -f "$1" | grep -q /headlamp/' _ {} \;`.
+
+### Session 2026-11-11 (night, cont.) — BUILD.md, and two bugs it found in itself
+
+User: *"ok write clear build steps into a file and push it to development only."* → `BUILD.md` (299
+lines) at the repo root, linked from `README.md`, pushed as `a4862f5` (`development` only; `main`
+still `30d8d26`).
+
+It leads with the question that kept getting missed: **which machine do I run this on?** — build
+anywhere, install on the machine that will *serve* the dashboard, because `install.sh` never uses
+`ssh` and the machine is decided by where you type it; separately, the **cluster** is decided by the
+kubeconfig's `server:`. Then the five steps with expected output, options table, file layout,
+verification, "correct but looks wrong" list, day-2, the upstream bump, an 11-row troubleshooting
+table, and what you do not need.
+
+**Two errors in my own first draft, found by running the commands instead of trusting the draft:**
+1. **A KubeOS node has `wget`, NOT `curl`.** Both preflight one-liners said `curl -sk …` and would
+   have failed on the very machine the document is for. Replaced with
+   `kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz` (prints `ok`) and
+   `wget --no-check-certificate -q -O /dev/null https://127.0.0.1:30443/`. `install.sh` was already
+   right about this — it polls with curl *or* wget — which is why the installer worked on a node with
+   no curl while my documentation did not.
+2. The integrity check is `sha256sum -c sha256sums.txt` **inside the unpacked release** (829 files,
+   all OK), not a check of the tarball's own hash.
+
+Verified after the push: remote `development` = `a4862f5` (== local), tree clean, builder re-synced
+(`BUILD.md` sha256 identical on host and builder).
