@@ -52,6 +52,9 @@ the ISO has no Node toolchain.
 
 ## Deploy as a binary (systemd, no container)
 
+**Step by step from `git clone` to a running service: [`BUILD.md`](BUILD.md).** The short version
+follows here.
+
 The dashboard also ships as a **host service**: a static `headlamp-server` binary, the
 built frontend, the KubeOS plugin, a systemd unit and an installer - no container runtime,
 no Pod. This is the form KubeOS itself uses, because the node runs its control plane as
