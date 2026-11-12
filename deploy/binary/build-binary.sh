@@ -184,6 +184,10 @@ cp "$HERE/kubeos-console.service" "$HERE/kubeos-dashboard-auth.service" "$STAGE/
 # its own. It sits on the public port, so it is part of the release, not of the node.
 cp "$HERE/authproxy.py" "$STAGE/authproxy.py"
 chmod 0755 "$STAGE/authproxy.py"
+
+# kubeos-trust-ca: the "why is https not secure" helper (install.sh puts it in /usr/bin).
+cp "$HERE/trustca.sh" "$STAGE/trustca.sh"
+chmod 0755 "$STAGE/trustca.sh"
 # The host console: the node's own PTY over TLS, so the Shell button creates no Pod.
 cp "$HERE/console.py" "$STAGE/console/console.py"
 chmod 0644 "$STAGE/console/console.py"

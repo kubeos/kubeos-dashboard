@@ -66,6 +66,8 @@ CONSOLE_UNIT=/etc/systemd/system/$CONSOLE_SERVICE.service
 CONSOLE_TOKEN=$CONF_DIR/console.token
 # How often the login gateway re-asks whether this machine is still a node.
 PROBE_INTERVAL=10
+# Seconds a removed node waits before rebuilding itself as a standalone node.
+STANDALONE_AFTER=120
 CONSOLE_SECRET=kubeos-console-token
 CONSOLE_PORT=30444
 DO_CONSOLE=1
@@ -427,6 +429,12 @@ fi
 if [ "$DO_LOGIN" -eq 1 ]; then
     [ -s "$SRC/authproxy.py" ] || die "incomplete release: $SRC/authproxy.py is missing (or use --no-login)"
     install -m 0755 "$SRC/authproxy.py" "$BIN_DIR/authproxy.py"
+    # One-time certificate help, so nobody has to remember the browser's import path:
+    #   kubeos-trust-ca            -> the CA, its fingerprint, the per-browser one-liners
+    #   kubeos-trust-ca --system   -> trust it for this node's own curl/wget as well
+    if [ -s "$SRC/trustca.sh" ]; then
+        install -m 0755 "$SRC/trustca.sh" /usr/bin/kubeos-trust-ca
+    fi
     if [ ! -s "$AUTH_SESSION_KEY" ]; then
         (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$AUTH_SESSION_KEY")
         chmod 0600 "$AUTH_SESSION_KEY"
@@ -500,10 +508,10 @@ if [ "$DO_LOGIN" -eq 1 ]; then
         # the detached page's "Join a cluster" box from the node side, so the token never reaches
         # a browser and the console's same-origin rule is satisfied (server requests carry no
         # Origin header).
-        printf 'AUTH_ARGS=--listen %s --port %s --upstream-port %s --tls-cert %s/tls.crt --tls-key %s/tls.key --session-key %s --session-hours %s --ca-file %s --kubeconfig %s/kubeconfig --probe-interval %s --console-port %s --console-token-file %s\n' \
+        printf 'AUTH_ARGS=--listen %s --port %s --upstream-port %s --tls-cert %s/tls.crt --tls-key %s/tls.key --session-key %s --session-hours %s --ca-file %s --kubeconfig %s/kubeconfig --probe-interval %s --console-port %s --console-token-file %s --standalone-after %s\n' \
             "$LISTEN_ADDR" "$PORT" "$HEADLAMP_PORT" "$CONF_DIR" "$CONF_DIR" "$AUTH_SESSION_KEY" \
             "$SESSION_HOURS" "$CA_CERT_FILE" "$CONF_DIR" "$PROBE_INTERVAL" "$CONSOLE_PORT" \
-            "$CONSOLE_TOKEN"
+            "$CONSOLE_TOKEN" "$STANDALONE_AFTER"
     } > "$AUTH_ENV"
     chmod 0644 "$AUTH_ENV"
     install -m 0644 "$SRC/systemd/$AUTH_SERVICE.service" "$AUTH_UNIT"
