@@ -1920,3 +1920,139 @@ Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
   returns 200 with the SPA shell, so string checks against that URL are always empty - the earlier "0 occurrences" checks for
   the removed Nodes page and "served by" chip were reading HTML. Confirmed live at the right URL: JoinCluster=1,
   JoinNode=0, servedby=0, kubeos-nodes=0, Restart=1, NFS=1.
+
+- 2026-11-12 21:40 **Pushed to `development` only: `c9b086d..6be1895`** (user: *"ok now push to development only
+  kubeos-dashboard"*). Three commits: `f07e71f` (membership gateway in `authproxy.py`, `console.py`'s `GET /node`,
+  `install.sh` flags), `8de5e7a` (Nodes page + "served by" chip removed, sidebar label "Join Cluster", bundle rebuilt),
+  `6be1895` (memory). Remote verified: `development = 6be1895`, **`main` still `7a8213b`** - not pushed, and it needs the
+  user to say "main" in the same message, per the standing rule. Left untracked on purpose: `autherror.png` and
+  `kubeos-branding/src/nodesview.tsx` (the unrequested Nodes page, never imported in any commit).
+
+- 2026-11-12 21:47 **KubeOS pushed to `development` only too** (`da8e83a..90bdbc3`): the two `kubeos-node-join` fixes that
+  this repo's Shell/join behaviour depends on (stop the control-plane units after the reset; adopt the cluster's console
+  token and restart `kubeos-console`). `master` left at `da8e83a`, as asked. Both repos now carry the work on
+  `development` - dashboard `6be1895`, KubeOS `90bdbc3`.
+
+- 2026-11-12 22:20 **Three features built and deployed (user picked 2, 3, 4 of my recommendations).**
+  **(2) `deploy/binary/trustca.sh` -> `/usr/bin/kubeos-trust-ca`**: prints the cluster CA, its colon-formatted SHA-256
+  fingerprint and the exact per-browser import steps; `--system` installs it for the node's own curl/wget/git
+  (`/usr/local/share/ca-certificates/kubeos-cluster-ca.crt`, `--remove` undoes it), `--browser USER` writes that user's NSS
+  store through `certutil`, `--desktop` prints the client-side commands. The **login page** now carries the fingerprint and
+  the download link: `authproxy.pem_fingerprint()` reproduces `openssl x509 -fingerprint -sha256` byte for byte (checked).
+  **(4) node health card**: `GET /kubeos-node-health` in the gateway (root-side `/proc`, `systemctl --failed`, `statvfs` for
+  `/` + `/var/lib/kubelet` + `/opt/local-path-provisioner`, kubelet/containerd/kubeadm versions, 15 s cache) and
+  `src/nodehealth.tsx` registering a **details-view section on the Node page** - no new sidebar entry on purpose.
+  **(3) etcd snapshots**: `console.py` `GET /etcd/snapshots`, `POST /etcd/snapshot`, `GET /etcd/snapshot?name=` (streamed
+  download), `DELETE /etcd/snapshot?name=`; host-side `etcdctl` with the node's etcd PKI, no Pod, no image; a worker answers
+  `409 {"supported": false, "error": "this machine is not a control plane..."}`. `src/snapshots.tsx` adds the **Snapshots**
+  page (take / list / download / delete) and says that **restore is deliberately not a button**. Taken for real on kubeos1:
+  `kubeos-etcd-20261112T164335Z.db`, 1 282 080 bytes, dir `0700 root:root`, download sha256 identical; the page's
+  Not-a-control-plane text is what a worker shows. **Two bugs found by running, not reading:** the handler helper is
+  `_send_json` (my first version called `_json` -> `AttributeError`, empty reply) and `etcdctl snapshot status` does not
+  exist in etcd 3.6+ (it moved to `etcdutl`, absent from the ISO) so there is no offline integrity check yet. Not committed.
+
+- 2026-11-12 22:27 **Option A shipped (user: "yes go with A"): a removed node rebuilds itself as a standalone node, so its
+  address always serves a real dashboard.** Dashboard-side pieces: `console.py` `POST/GET /action/standalone` (transient
+  unit `kubeos-node-standalone`; no `--collect`, so `Result` stays truthful) and `authproxy.py` `--standalone-after N`
+  (default 120 s): the membership probe fires `request_standalone()` **once per detached episode**, re-arms itself on a
+  failed start (which is exactly what saved the first live run: the console still had the old `console.py` and answered
+  `404 unknown action: standalone`; ten seconds later the retry succeeded), and the transient detached page now says
+  "rebuilds itself as a standalone KubeOS node in Ns (unless you paste a join string)". The work itself is the ISO's
+  first-boot path re-driven (`node-setup.service` must be `stop`ped first - it is `Type=oneshot` + `RemainAfterExit=yes`
+  and stays "active" for ever). Measured on kubeos2: removed -> detached after 10 s -> trigger at +120 s -> node-setup
+  success after 30 s -> install.sh re-pointed the dashboard -> `.6` = `<title>KubeOS</title>` listing `['kubeos2']`
+  while `.5` listed `['kubeos1']`. The pair is two clusters again until re-joined. Not committed.
+
+- **2026-11-12 23:00 - the joining node now shows a spinner, and a re-join no longer dies on a stale Node record.**
+  User's change #1 (`CHANGE.png`): after "Join this node" the joining node's dashboard must show a small rounded
+  loading circle until the node is fully added - never the red *"Lost connection to the cluster / Bad Gateway"*. The
+  page is `JOINING_PAGE` in `deploy/binary/authproxy.py`, served by the **join guard** (`join_in_progress()`, 2 s cache,
+  `systemctl is-active kubeos-node-join` + last journal line) which sits **before** the detached gate, so it also stops
+  option A's `--standalone-after` timer from firing mid-join; `kubeos-branding/src/addnode.tsx` keeps its own
+  `CircularProgress` on the button and the "Joining... do not close this tab" card (`joinStep` polls `/action/join`
+  every 3 s). **Measured with an authenticated session** (curl cookie jar from `/kubeos-login` as `root`, 2 s poll):
+  `t+2` dashboard shell -> `t+6...t+14` JOINING_PAGE -> one ~2 s window with the connection refused (the join's final
+  `try-restart` of the three dashboard units; a browser refresh landing exactly there shows its own error page and
+  needs one manual reload - a known, accepted rough edge) -> `t+18` dashboard with the node Ready, stable 130 s.
+  No red warning at any point. Same session found a real ISO-side bug that this dashboard flow exposed: a **re-join**
+  fails with `a Node with name "kubeos2" and status "Ready" already exists in the cluster`; fixed in the ISO's
+  `kubeos-node-join` (section 2c deletes this machine's own record using the kubeconfig the join string carries),
+  verified twice on the live pair. Nothing committed or pushed.
+
+- **2026-11-12 23:06 - change #2: the standalone page spins when you click Join.** User (screenshot of the detached
+  page): *"SAME WAY AT THIS STEP ALSO HERE TOO WITH LOADING BAR.. OTHERWISE USER IS BORED.."*. `STANDALONE_PAGE` in
+  `deploy/binary/authproxy.py` now has `.spinner` (34 px lime circle, same `@keyframes spin` as `JOINING_PAGE`), a hidden
+  `#spinning` block ("Joining this machine to a cluster...", `#spin-detail` fed by the gateway's live journal line, and a
+  "do not close this tab; refresh if it fails to load" note), `showSpinning()` / `hideSpinning()` helpers (hide restores
+  the textarea and button and shows the error, so a refused join is retryable), and `pollState()` calls `showSpinning()`
+  on `state: "joining"`, so reloading mid-join returns to the spinner instead of the bare form. Poll interval 5 s -> 3 s.
+  Measured through the real route: page 9833 B with markup -> `POST /kubeos-standalone/join` 202 -> `t+4...t+60`
+  JOINING_PAGE -> `t+62` dashboard as `member`. Deployed `c8dafeee...` to both nodes (live + release copy) and restarted
+  `kubeos-dashboard-auth`. Note for the next person: the gateway's `/kubeos-standalone/state` already reports
+  `joining` (it is the same `join_in_progress()` guard that shields the standalone timer), so any new client-side state
+  should key off that value rather than probing systemd itself. Nothing committed or pushed.
+
+- **2026-11-12 23:30 - join card: only the two lines, and the tab reloads itself (module-scope watcher).** The card in
+  `kubeos-branding/src/addnode.tsx` used to print the console's last journal line, which for a *finished transient unit*
+  is `kubeos-node-join.service: Failed to open /run/systemd/transient/kubeos-node-join.service: No such file or
+  directory` - it reads as a crash (user report). Removed, together with the "The page reloads itself..." caption and the
+  second "Join started on this node..." paragraph: while a join runs the page is replaced by a **full-screen notice**
+  (fixed, zIndex 2500) showing only `Joining... do not close this tab` + the detail sentence. The real bug was the
+  reload: it lived in a `React.useEffect`, and Headlamp's own red "Lost connection / Bad Gateway" screen (the SPA's API
+  server has just been replaced) unmounts that component, killing the watcher right when it was needed - the tab stayed
+  on the error for ever. `watchJoinUntilDone()` is now module scope (`window.setInterval`, immune to unmount), started by
+  the click handler: `/action/join` every 3 s -> `seenRunning || 8 s grace` -> finished -> poll `/healthz` until 200 ->
+  `location.reload()`. Verified natively on kubeos2 during a live join: `young` x2 -> `running` x3 -> `FINISHED
+  (Result=success, inactive)` -> `healthz 200` -> reload. Bundle `aa8c95f1...` deployed to both nodes (live + release
+  copy). Rule for future work: anything that must survive the dashboard losing its own cluster cannot be a component's
+  effect. Nothing committed or pushed.
+
+- **2026-11-12 23:40 - the standalone page spins while the node rebuilds itself, and returns to the dashboard alone.**
+  User: *"same issue at 'THis machine is not part of cluster' while kubeos2 becoming standalone.. didn;t show bar at all
+  and no reload also"*. `authproxy.py`: (1) new `standalone_bringup_in_progress()` (2 s cache) probing
+  `systemctl is-active kubeos-node-standalone` - the right unit because it blocks on `systemctl start
+  node-setup.service` and so spans the whole rebuild (`node-setup.service` is `RemainAfterExit=yes`, "active" for ever);
+  `/kubeos-standalone/state` now answers `rebuilding` and `STANDALONE_PAGE` shows the shared spinner block retitled
+  "Rebuilding this machine as a standalone KubeOS node..." (`#spin-title`, `showSpinning(detail, title)`).
+  (2) new `pollPage()` every 3 s: re-fetch `/`, reload as soon as the body is no longer the standalone page. This is the
+  important one - the old handover relied on `state === 'member'` from `/kubeos-standalone/state`, which is **behind the
+  login gate** (401 `{"error":"not signed in"}` without the cookie), so a session that died while `install.sh` reinstalled
+  the dashboard left the tab stuck for ever. Measured through a real removal + option-A rebuild: `member/DASHBOARD` ->
+  `detached` (countdown) -> `rebuilding` (spinner, exactly at the 120 s trigger) -> `/` returns the dashboard =>
+  "BROWSER WOULD RELOAD" -> `member`; `kubeos-node-standalone` `Result=success`. Deployed `160c6314...` on both nodes.
+  Nothing committed or pushed.
+
+- **2026-11-13 00:05 - the standalone page: error line gone, rebuild page added, and the real cause found in the ISO.**
+  The user's "no bar too" survived the earlier UI work because the *rebuild itself* was broken, not the page: the ISO's
+  `kubeos-node-standalone` stopped only kubelet before wiping `/etc/kubernetes/*` and `/var/lib/etcd/*`, so on a machine
+  that was already its own control plane etcd re-created its store and the re-run ended with `kubernetes-admin` **403** -
+  node-setup hung 4+ min, the gateway's membership probe could never say `member`, and no page logic could hand the
+  browser over. Fixed in the ISO (stop every control-plane unit, wait for etcd, then delete; rebuild now 30 s).
+  Dashboard side, same round: (1) the `Error from server (NotFound)…` line is **gone** from `STANDALONE_PAGE`
+  (`id="detail"` and the `__DETAIL__` placeholder deleted); (2) the page shows the spinner as soon as its countdown hits
+  0, not only when `/state` says `rebuilding`; (3) new server-rendered `REBUILDING_PAGE` (`KubeOS - rebuilding this node`,
+  same lime spinner, **no meta refresh** - a refresh during the unit restart would leave the browser's error page - JS
+  handover via `pollPage`) served for `/` while `standalone_bringup_in_progress()`; (4) `pollPage`'s marker list now knows
+  both of its own incarnations ('not part of a cluster' OR 'Rebuilding this machine as a standalone'), so neither page
+  reloads itself in a loop and both leave for the dashboard. Measured: `STANDALONE` until `t+117`, `REBUILD_PAGE` from
+  `t+120`. Deployed `authproxy.py` `d4df3826...` on both nodes. Nothing committed or pushed.
+
+- **2026-11-13 00:12 - N-node note for whoever touches the Join story next.** The user's requirement is "as many nodes as
+  the end user attaches", not two. Checked against the dashboard side: everything here is count-agnostic (membership
+  probe asks about this host's own node name; health card, snapshots and the join/standalone pages loop over whatever
+  the cluster holds; no node names in code). The one real multi-node gap is **outside** the dashboard: the ISO's
+  per-node bridge CNI has no routes between pod CIDRs, so pods on different nodes cannot reach each other or each
+  other's Services (measured: 100 % loss across nodes, refused via ClusterIP, while same-node and pod-to-internet work).
+  Plan is a host-side `kubeos-pod-routes` reconciler in the ISO; the dashboard needs no change for it. The user is
+  bringing up a third node (kubeos3) to prove it at N=3.
+
+- **2026-11-13 00:35 - release regenerated and installed on FOUR nodes; the multi-node gap turned out to be in the ISO.**
+  `deploy/binary/build-binary.sh` produced `release/kubeos-dashboard-0.1.0-linux-amd64.tar.gz` (sha256
+  `8d6f70e5...`, 123M unpacked / 50M compressed), whose `authproxy.py` is `d4df3826...` - i.e. the same code the two
+  older nodes already ran - and it was installed on the two brand-new nodes (kubeos3 192.168.122.7, kubeos4
+  192.168.122.8), which had no dashboard at all (the ISO still does not ship it; the release was transferred by hand).
+  All four nodes now run one dashboard build and each lists all four nodes. Testing 4 pods (one per node) showed every
+  cross-node pod pair dead - but that is the ISO's per-node bridge CNI, not the dashboard; it is fixed there by the new
+  `kubeos-pod-routes` unit (see MEMORY of the KubeOS repo), and the dashboard needed no change for it. Lesson for this
+  repo: "does the dashboard work on N nodes" and "does the platform work on N nodes" are different questions - the
+  dashboard side was already count-agnostic, the evidence had to come from pods, not pages.
