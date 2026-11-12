@@ -90,6 +90,25 @@ def _crypt(word: str, salt: str) -> str | None:
     return out.decode() if out else None
 
 
+def pem_fingerprint(pem: bytes) -> str:
+    """SHA-256 fingerprint of a PEM certificate, formatted like `openssl x509 -fingerprint`.
+
+    WHY it is printed on the login page: a browser cannot be taught a CA by a web page, so the
+    import is manual - and a manual import without something to compare against is a blind
+    "yes" to whatever certificate the page served. Showing the fingerprint turns it into a
+    check the user can pass, which is the whole point of a private CA over plain http.
+    """
+    try:
+        body = pem.decode("ascii", "replace")
+        start = body.index("-----BEGIN CERTIFICATE-----") + len("-----BEGIN CERTIFICATE-----")
+        end = body.index("-----END CERTIFICATE-----")
+        der = base64.b64decode("".join(body[start:end].split()))
+        digest = hashlib.sha256(der).hexdigest().upper()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
 def shadow_hash(user: str) -> str | None:
     try:
         with open(SHADOW, "r", encoding="utf-8", errors="replace") as handle:
@@ -195,6 +214,9 @@ LOGIN_PAGE = """<!doctype html>
   button:hover { background:#d3ff5c; }
   .err { margin-top:14px; color:#ff8080; font-size:13px; min-height:18px; }
   .note { margin-top:16px; color:#6f7a6a; font-size:11px; border-top:1px solid #1d211c; padding-top:12px; }
+  .note.cert { border-top:0; padding-top:6px; }
+  .note.cert code { font-size:10px; word-break:break-all; color:#9aa596; }
+  .note.cert a { color:#c4ff2e; text-decoration:none; }
 </style></head>
 <body><form class="card" method="post" action="/kubeos-login">
   <div class="brand"><b>KUBEOS</b><span>__HOST__</span></div>
@@ -205,6 +227,7 @@ LOGIN_PAGE = """<!doctype html>
   <button type="submit">Log in</button>
   <div class="err">__ERROR__</div>
   <div class="note">This node's own account - the password you set when you installed KubeOS.</div>
+  <div class="note cert">__CERT__</div>
 </form></body></html>
 """
 
@@ -238,6 +261,99 @@ Service: <code>systemctl status kubeos-dashboard</code> on this node.</p>
 """
 
 
+JOINING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KubeOS - joining a cluster</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0b0b0b; color:#e8e8e8; font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .card { width:min(92vw,540px); background:#111312; border:1px solid rgba(196,255,46,.25);
+          border-radius:10px; padding:26px; text-align:center; }
+  .brand { display:flex; align-items:baseline; justify-content:center; gap:10px; margin-bottom:18px; }
+  .brand b { color:#c4ff2e; letter-spacing:.14em; font-size:15px; }
+  .brand span { color:#6f7a6a; font-size:11px; letter-spacing:.18em; text-transform:uppercase; }
+  /* the spinner: the whole point of this page is that something is visibly happening,
+     because the node's own cluster is being thrown away underneath the browser. */
+  .spinner { width:46px; height:46px; margin:6px auto 18px; border-radius:50%;
+             border:4px solid rgba(196,255,46,.18); border-top-color:#c4ff2e;
+             animation:spin 900ms linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  h1 { font-size:16px; margin:0 0 10px; }
+  p { margin:8px 0; color:#c9cfc6; }
+  .step { margin-top:14px; padding:10px 12px; border-radius:8px; background:#0d0f0d;
+          border:1px solid #23271f; color:#9aa596; font:12px/1.5 ui-monospace,monospace;
+          text-align:left; word-break:break-word; }
+  .note { margin-top:16px; color:#8b968a; font-size:12px; border-top:1px solid #1d211c; padding-top:12px; }
+</style></head>
+<body><div class="card">
+  <div class="brand"><b>KUBEOS</b><span>__HOST__</span></div>
+  <div class="spinner"></div>
+  <h1>Joining this machine to a cluster</h1>
+  <p>Its own one-node cluster is being discarded and it is joining the control plane whose token you
+     pasted. <strong>This dashboard disappears while that happens and comes back by itself</strong>
+     when the node is Ready - usually under a minute.</p>
+  <div class="step">__STEP__</div>
+  <p class="note">This page refreshes every 5 seconds. It is not an error: nothing is broken, and
+     you do not need to do anything. If it stays here for more than a few minutes, check
+     <code>systemctl status kubeos-node-join</code> on this node.</p>
+</div></body></html>
+"""
+
+# Served for "/" while the AUTOMATIC rebuild (option A) runs. Without it a browser that loads the
+# page at that moment gets the standalone page - which looks frozen, because the machine's own
+# dashboard units are being reinstalled underneath it (user, 2026-11-12: *"while kubeos2 becoming
+# standalone.. didn't show bar at all"*). No meta refresh on purpose: for a few seconds the gateway
+# itself is down, and a refresh landing there would leave the BROWSER'S error page on screen. The
+# script below reloads only once "/" is something else again.
+REBUILDING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KubeOS - rebuilding this node</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0b0b0b; color:#e8e8e8; font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .card { width:min(92vw,540px); background:#111312; border:1px solid rgba(196,255,46,.25);
+          border-radius:10px; padding:26px; text-align:center; }
+  .brand { display:flex; align-items:baseline; justify-content:center; gap:10px; margin-bottom:18px; }
+  .brand b { color:#c4ff2e; letter-spacing:.14em; font-size:15px; }
+  .brand span { color:#6f7a6a; font-size:11px; letter-spacing:.18em; text-transform:uppercase; }
+  .spinner { width:46px; height:46px; margin:6px auto 18px; border-radius:50%;
+             border:4px solid rgba(196,255,46,.18); border-top-color:#c4ff2e;
+             animation:spin 900ms linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  h1 { font-size:16px; margin:0 0 10px; }
+  p { margin:8px 0; color:#c9cfc6; }
+  .note { margin-top:16px; color:#8b968a; font-size:12px; border-top:1px solid #1d211c; padding-top:12px; }
+</style></head>
+<body><div class="card">
+  <div class="brand"><b>KUBEOS</b><span>__HOST__</span></div>
+  <div class="spinner"></div>
+  <h1>Rebuilding this machine as a standalone KubeOS node</h1>
+  <p>The cluster this machine belonged to does not know it any more, so it is building its own
+     one-node cluster again. <strong>Nothing is broken and there is nothing to do.</strong></p>
+  <p class="note">This page returns to the dashboard by itself when that has finished - usually
+     under a minute. Do not close this tab.</p>
+</div>
+<script>
+(function () {
+  var MARKERS = ['not part of a cluster', 'Rebuilding this machine as a standalone'];
+  window.setInterval(function () {
+    fetch('/', { cache: 'no-store' })
+      .then(function (answer) { return answer.text(); })
+      .then(function (text) {
+        var mine = MARKERS.some(function (marker) { return text.indexOf(marker) !== -1; });
+        if (!mine) { window.location.reload(); }
+      })
+      .catch(function () { /* the dashboard is restarting: expected here */ });
+  }, 3000);
+}());
+</script>
+</body></html>
+"""
+
 STANDALONE_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -269,6 +385,13 @@ STANDALONE_PAGE = """<!doctype html>
   button[disabled] { opacity:.45; cursor:default; }
   .note { color:#8b968a; font-size:12px; border-top:1px solid #1d211c; margin-top:14px; padding-top:12px; }
   .status { margin-top:12px; font-size:13px; min-height:20px; }
+  /* Same lime spinner as the joining page, so the click answers instantly: the join takes a
+     minute and a button that only greys out reads as "nothing happened" (user, 2026-11-12). */
+  .spinner { width:34px; height:34px; margin:4px auto 12px; border-radius:50%;
+             border:4px solid rgba(196,255,46,.18); border-top-color:#c4ff2e;
+             animation:spin 900ms linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #spinning { display:none; text-align:center; }
 </style></head>
 <body><div class="wrap">
   <div class="brand"><b>KUBEOS</b><span>__HOST__</span></div>
@@ -278,7 +401,7 @@ STANDALONE_PAGE = """<!doctype html>
     <p>The dashboard on <code>__HOST__</code> shows <strong>only this machine</strong>, because the
        cluster it belonged to does not know it any more (its node record was removed). The other
        machines are deliberately not shown here: that cluster is no longer this machine's.</p>
-    <p class="dim" id="detail">__DETAIL__</p>
+    <p id="soon" class="dim" style="color:#c4ff2e"></p>
   </div>
 
   <div class="card">
@@ -294,6 +417,14 @@ STANDALONE_PAGE = """<!doctype html>
       placeholder="KOSJOIN1.&hellip;  or  kubeadm join 192.168.122.5:6443 --token &hellip;"></textarea>
     <button id="join">Join this machine</button>
     <div class="status" id="status"></div>
+    <div id="spinning">
+      <div class="spinner"></div>
+      <p><strong id="spin-title">Joining this machine to a cluster&hellip;</strong></p>
+      <p class="dim" id="spin-detail" style="font-size:12px; min-height:18px"></p>
+      <p class="note">Do not close this tab. While the machine joins it restarts its own services,
+         so this tab can fail to load for a second - refresh it, or wait: the page turns into the
+         dashboard by itself once the node is Ready.</p>
+    </div>
     <p class="note">Joining discards this machine's own cluster and makes it a worker of the one whose
        string you pasted. This page turns back into the dashboard by itself when that has happened.</p>
   </div>
@@ -310,6 +441,33 @@ STANDALONE_PAGE = """<!doctype html>
     if (cls) { td.className = cls; }
     tr.appendChild(th); tr.appendChild(td);
     return tr;
+  }
+  // The join takes a minute (reset, kubeadm join, CNI, Ready). While that happens this machine
+  // restarts its own services, so the honest thing to show is a spinner and a sentence, not a
+  // greyed-out button that looks like nothing happened (user, 2026-11-12).
+  var spinSince = 0;
+  function showSpinning(detail, title) {
+    if (!spinSince) { spinSince = Date.now(); }
+    var head = el('spin-title');
+    if (head && title) { head.textContent = title; }
+    el('spinning').style.display = 'block';
+    el('bundle').style.display = 'none';
+    el('join').style.display = 'none';
+    el('status').style.display = 'none';
+    var line = el('spin-detail');
+    if (line && detail) { line.textContent = detail; }
+  }
+  function hideSpinning(message) {
+    el('spinning').style.display = 'none';
+    el('bundle').style.display = '';
+    el('join').style.display = '';
+    el('status').style.display = '';
+    el('join').disabled = false;
+    if (message) {
+      var status = el('status');
+      status.className = 'status bad';
+      status.textContent = message;
+    }
   }
   function readFacts() {
     var table = el('facts');
@@ -344,7 +502,35 @@ STANDALONE_PAGE = """<!doctype html>
         // Joined again: this page has nothing left to say, so hand the browser back to the
         // dashboard. The membership probe is what notices, which is why it runs here too.
         if (state.state === 'member') { window.location.reload(); return; }
-        if (state.detail) { el('detail').textContent = state.detail; }
+        // The unit is already running (a reload during a join, or another tab started it): keep
+        // the spinner up and carry the journal line, so the tab never looks stuck.
+        if (state.state === 'joining') { showSpinning(state.detail || ''); }
+        // The rebuild shows a spinner for two reasons at once: the gateway says so, or the
+        // countdown this page is already rendering has simply run out. The second one works even
+        // when the state request cannot be answered (the dashboard units are being reinstalled
+        // underneath this tab at that very moment).
+        var counting = typeof state.standalone_in === 'number' && state.standalone_in <= 0;
+        if (state.state === 'rebuilding' || counting) {
+          showSpinning('this machine is rebuilding its own one-node cluster; the dashboard comes ' +
+                       'back by itself when that is done',
+                       'Rebuilding this machine as a standalone KubeOS node\u2026');
+        } else if (state.state === 'detached' && spinSince && Date.now() - spinSince > 120000) {
+          // A rebuild that never started (or failed) must never trap the user behind a spinner:
+          // after two minutes give the form back.
+          hideSpinning();
+          spinSince = 0;
+        }
+        var soon = el('soon');
+        if (soon) {
+          if (state.standalone_in === null || state.standalone_in === undefined) {
+            soon.textContent = '';
+          } else if (state.standalone_in <= 0) {
+            soon.textContent = 'Rebuilding this machine as a standalone node now - the page comes back as the normal dashboard.';
+          } else {
+            soon.textContent = 'This machine rebuilds itself as a standalone KubeOS node in ' +
+              state.standalone_in + 's (unless you paste a join string above).';
+          }
+        }
       })
       .catch(function () {});
   }
@@ -357,8 +543,10 @@ STANDALONE_PAGE = """<!doctype html>
       return;
     }
     el('join').disabled = true;
+    spinSince = 0;
     status.className = 'status dim';
     status.textContent = 'Starting the join on this machine\u2026';
+    showSpinning('asking this machine\u2019s console to start the join\u2026');
     fetch('/kubeos-standalone/join', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -371,28 +559,263 @@ STANDALONE_PAGE = """<!doctype html>
         if (!answer.ok || answer.body.ok === false) {
           throw new Error(answer.body.error || 'the join was refused');
         }
-        status.className = 'status good';
-        status.textContent = 'The join is running as ' + (answer.body.unit || 'a systemd unit') +
-          '. This page reloads by itself when the machine is a node again.';
+        showSpinning('the join is running as ' + (answer.body.unit || 'a systemd unit') +
+          ' \u2014 waiting for this node to be Ready');
       })
       .catch(function (reason) {
-        status.className = 'status bad';
-        status.textContent = 'Could not start the join: ' + String(reason.message || reason);
-        el('join').disabled = false;
+        hideSpinning('Could not start the join: ' + String(reason.message || reason));
       });
   });
+  // The handover back to the dashboard is decided by the PAGE, not by /kubeos-standalone/state:
+  // that endpoint needs the login session, so if the session dies while the machine rebuilds
+  // itself (the dashboard units are reinstalled underneath this tab) the answer is a 401, the
+  // old code saw no state, and the tab never came back - the user's "no reload also"
+  // (2026-11-12). Re-fetching "/" needs nothing: it is the standalone page while this machine is
+  // on its own, and the dashboard (or the sign-in page) the moment it is not.
+  function pollPage() {
+    fetch('/', { cache: 'no-store' })
+      .then(function (answer) { return answer.text(); })
+      .then(function (text) {
+        var stillMine = text.indexOf('not part of a cluster') !== -1 ||
+                        text.indexOf('Rebuilding this machine as a standalone') !== -1;
+        if (!stillMine) { window.location.reload(); }
+      })
+      .catch(function () {
+        // the dashboard is restarting underneath this tab: expected, try again in a moment
+      });
+  }
   readFacts();
   pollState();
-  window.setInterval(pollState, 5000);
+  // 3 s, not 5: this page has to feel alive while the join or the rebuild runs.
+  window.setInterval(pollState, 3000);
+  window.setInterval(pollPage, 3000);
 }());
 </script>
 </body></html>
 """
 
 
+# ---------------------------------------------------------------------------- host health
+HEALTH_TTL = 15.0            # seconds a health reading is reused
+VERSION_TTL = 300.0         # versions change only on an upgrade
+_health_cache: dict = {"at": 0.0, "value": None}
+_health_lock = threading.Lock()
+
+
+def _run(argv: list[str]) -> str:
+    """Run a read-only host command; an unavailable tool is not an error worth failing on."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=15,
+                              env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                                   "HOME": "/tmp"})
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (done.stdout or "").strip()
+
+
+def _disk(path: str) -> dict | None:
+    """Used/free for a mount point, without needing `df` to be present."""
+    try:
+        stats = os.statvfs(path)
+    except OSError:
+        return None
+    total = stats.f_blocks * stats.f_frsize
+    free = stats.f_bfree * stats.f_frsize
+    return {
+        "path": path,
+        "total_bytes": total,
+        "free_bytes": free,
+        "used_percent": round(100.0 * (total - free) / total, 1) if total else 0.0,
+    }
+
+
+def host_health(membership_state: str, membership_detail: str) -> dict:
+    """Everything an operator wants before wondering whether to SSH into the machine.
+
+    WHY FROM THE HOST: on a KubeOS node the interesting failures are systemd units, the disk
+    holding container images and pod data, and the kernel/containerd/kubelet versions - none of
+    which the Kubernetes API reports. The gateway runs as root on that machine, so it can read
+    them without a Pod, a token or a cluster, which is also what makes the card work on a node
+    that is not part of any cluster yet.
+    """
+    now = time.monotonic()
+    with _health_lock:
+        cached = _health_cache.get("value")
+        if cached is not None and now - float(_health_cache.get("at") or 0) < HEALTH_TTL:
+            value = dict(cached)
+            value["membership"] = {"state": membership_state, "detail": membership_detail}
+            return value
+
+    uptime_seconds = 0.0
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as handle:
+            uptime_seconds = float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    load = ""
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as handle:
+            load = " ".join(handle.read().split()[:3])
+    except OSError:
+        pass
+    pretty_name = ""
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("PRETTY_NAME="):
+                    pretty_name = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except OSError:
+        pass
+
+    failed = []
+    for line in _run(["/usr/bin/systemctl", "--failed", "--no-legend", "--no-pager"]).splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if unit:
+            failed.append(unit)
+
+    versions = {}
+    if now - float(_health_cache.get("versions_at") or 0) > VERSION_TTL or not _health_cache.get("versions"):
+        for name, argv in (
+            ("kubelet", ["/usr/bin/kubelet", "--version"]),
+            ("containerd", ["/usr/bin/containerd", "--version"]),
+            ("kubeadm", ["/usr/bin/kubeadm", "version", "-o", "short"]),
+        ):
+            output = _run(argv).splitlines()
+            versions[name] = output[0] if output else ""
+        _health_cache["versions"] = versions
+        _health_cache["versions_at"] = now
+    else:
+        versions = _health_cache["versions"]
+
+    disks = [entry for entry in (_disk("/"), _disk("/var/lib/kubelet"),
+                                 _disk("/opt/local-path-provisioner")) if entry]
+
+    value = {
+        "hostname": socket.gethostname(),
+        "os": pretty_name,
+        "kernel": os.uname().release,
+        "uptime_seconds": int(uptime_seconds),
+        "load": load,
+        "failed_units": failed,
+        "disks": disks,
+        "versions": {k: v for k, v in versions.items() if v},
+        "membership": {"state": membership_state, "detail": membership_detail},
+    }
+    with _health_lock:
+        _health_cache["at"] = now
+        _health_cache["value"] = {k: v for k, v in value.items() if k != "membership"}
+    return value
+
+
 # --------------------------------------------------------------------------- membership
 KUBECTL = "/usr/bin/kubectl"
 DEFAULT_KUBECONFIG = "/etc/kubeos-dashboard/kubeconfig"
+
+
+JOIN_STATE_TTL = 2.0
+_join_cache: dict = {"at": 0.0, "running": False, "detail": ""}
+
+
+def join_in_progress() -> tuple[bool, str]:
+    """Is `kubeos-node-join` running on this machine right now?
+
+    WHY THE GATEWAY ASKS: during a join the machine deliberately destroys its own cluster, so for
+    ~half a minute it looks exactly like a node that was REMOVED - and with option A that is a state
+    which rebuilds itself as standalone. Without this check a join would race the standalone timer
+    and could even lose, leaving a half-joined machine. A join also has to be announced honestly to
+    the browser: a spinner saying "joining", not a red "Bad Gateway" (user, 2026-11-12).
+    """
+    now = time.monotonic()
+    with _health_lock:
+        if now - float(_join_cache.get("at") or 0) < JOIN_STATE_TTL:
+            return bool(_join_cache.get("running")), str(_join_cache.get("detail") or "")
+    running = False
+    detail = ""
+    try:
+        done = subprocess.run(["/usr/bin/systemctl", "is-active", "kubeos-node-join"],
+                              capture_output=True, text=True, timeout=10,
+                              env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+        state = (done.stdout or "").strip()
+        running = state in ("active", "activating", "deactivating", "reloading")
+        if running:
+            tail = subprocess.run(
+                ["/usr/bin/journalctl", "-u", "kubeos-node-join", "-n", "1", "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=10,
+                env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+            detail = (tail.stdout or "").strip()[-240:]
+    except (OSError, subprocess.TimeoutExpired):
+        running, detail = False, ""
+    with _health_lock:
+        _join_cache["at"] = now
+        _join_cache["running"] = running
+        _join_cache["detail"] = detail
+    return running, detail
+
+
+STANDALONE_STATE_TTL = 2.0
+_standalone_cache: dict = {"at": 0.0, "running": False}
+
+
+def standalone_bringup_in_progress() -> bool:
+    """Is `kubeos-node-standalone` running on this machine right now?
+
+    WHY THE PAGE ASKS: the browser sitting on the "this machine is not part of a cluster" page has
+    no other way to learn that the automatic rebuild has STARTED - and that is exactly the minute
+    it shows nothing at all (user, 2026-11-12: *"while kubeos2 becoming standalone.. didn't show
+    bar at all and no reload also"*). The transient unit wraps the whole rebuild: it starts
+    `node-setup.service` and stays active until that oneshot finishes, so its state is the
+    rebuild's state. `node-setup.service` itself cannot be used - it is `RemainAfterExit=yes` and
+    therefore reports "active" for ever after the first boot.
+    """
+    now = time.monotonic()
+    with _health_lock:
+        if now - float(_standalone_cache.get("at") or 0) < STANDALONE_STATE_TTL:
+            return bool(_standalone_cache.get("running"))
+    running = False
+    try:
+        done = subprocess.run(["/usr/bin/systemctl", "is-active", "kubeos-node-standalone"],
+                              capture_output=True, text=True, timeout=10,
+                              env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+        running = (done.stdout or "").strip() in ("active", "activating", "deactivating", "reloading")
+    except (OSError, subprocess.TimeoutExpired):
+        running = False
+    with _health_lock:
+        _standalone_cache["at"] = now
+        _standalone_cache["running"] = running
+    return running
+
+
+def request_standalone(console_port: int, token_file: str) -> tuple[bool, str]:
+    """Ask this node's console to make it a standalone node again (POST /action/standalone).
+
+    The console owns the work (it starts a transient systemd unit, which survives the dashboard
+    restarting underneath it) and holds the token; this only says "now". No Origin header is sent,
+    so the console's same-origin rule is satisfied by construction.
+    """
+    token = ""
+    try:
+        with open(token_file, "r", encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as reason:
+        return False, f"console token unreadable ({reason})"
+    connection = http.client.HTTPSConnection("127.0.0.1", console_port, timeout=30,
+                                             context=UPSTREAM_TLS)
+    try:
+        connection.request("POST", "/action/standalone",
+                           body=b"{}", headers={
+                               "Authorization": f"Bearer {token}",
+                               "Content-Type": "application/json",
+                               "Content-Length": "2",
+                               "Host": f"127.0.0.1:{console_port}",
+                           })
+        response = connection.getresponse()
+        payload = response.read().decode("utf-8", "replace")
+        return 200 <= response.status < 300, f"HTTP {response.status}: {payload.strip()[:200]}"
+    except OSError as reason:
+        return False, f"console did not answer ({reason})"
+    finally:
+        connection.close()
 
 
 class Membership:
@@ -411,24 +834,76 @@ class Membership:
     the API refuses, means "removed" - so unknown keeps exactly today's behaviour.
     """
 
-    def __init__(self, kubeconfig: str, hostname: str, interval: float) -> None:
+    def __init__(self, kubeconfig: str, hostname: str, interval: float,
+                 standalone_after: float = 0.0, on_detached=None) -> None:
         self.kubeconfig = kubeconfig or ""
         self.hostname = hostname
         self.interval = max(3.0, interval)
+        # Seconds a machine must be CONTINUOUSLY detached before it rebuilds itself as a
+        # standalone node. 0 disables that (the old behaviour: show the page and wait).
+        self.standalone_after = max(0.0, standalone_after)
+        self.on_detached = on_detached
         self.state = "unknown"
         self.detail = "checking whether this machine is a node of a cluster"
+        self._detached_since = 0.0
+        self._standalone_fired = False
         self._lock = threading.Lock()
 
     def _set(self, state: str, detail: str) -> None:
         with self._lock:
             if state != self.state:
                 log(f"membership: {self.state} -> {state} ({detail or 'no detail'})")
+            if state == "detached" and self.state != "detached":
+                self._detached_since = time.monotonic()
+                self._standalone_fired = False
+            if state != "detached":
+                self._detached_since = 0.0
             self.state = state
             self.detail = detail
+
+    def _maybe_standalone(self) -> None:
+        """Once the machine has been removed long enough, let it become a node of its own.
+
+        WHY A DELAY: a node that merely lost the network is `unknown`, never `detached` (see
+        probe()), but a control plane being restarted for a minute is `detached` for that minute.
+        Waiting makes the difference between "somebody removed this node" and "the cluster is
+        briefly down" visible in time, and the work is only done once per detached episode.
+        """
+        if not self.on_detached or self.standalone_after <= 0:
+            return
+        # A join looks like a removal for a few seconds (the node's own cluster is being thrown
+        # away). It is not one, and this machine is busy with it.
+        if join_in_progress()[0]:
+            return
+        with self._lock:
+            if self.state != "detached" or self._standalone_fired:
+                return
+            if not self._detached_since or time.monotonic() - self._detached_since < self.standalone_after:
+                return
+            self._standalone_fired = True        # set before the call: never fire twice
+        log(f"has been removed from its cluster for {int(self.standalone_after)}s - "
+            "rebuilding this machine as a standalone node")
+        ok, detail = self.on_detached()
+        if ok:
+            log(f"standalone bring-up started ({detail})")
+        else:
+            log(f"WARNING: could not start the standalone bring-up: {detail}")
+            with self._lock:
+                self._standalone_fired = False   # a failed start may be retried
 
     def snapshot(self) -> tuple[str, str]:
         with self._lock:
             return self.state, self.detail
+
+    def standalone_in(self) -> int | None:
+        """Seconds until this machine rebuilds itself, or None when that will not happen."""
+        if self.standalone_after <= 0:
+            return None
+        with self._lock:
+            if self.state != "detached" or not self._detached_since:
+                return None
+            left = self.standalone_after - (time.monotonic() - self._detached_since)
+            return max(0, int(left))
 
     def probe(self) -> None:
         if not self.kubeconfig or not os.path.exists(self.kubeconfig):
@@ -465,6 +940,7 @@ class Membership:
     def _loop(self) -> None:
         while True:
             self.probe()
+            self._maybe_standalone()
             time.sleep(self.interval)
 
     def start(self) -> None:
@@ -485,6 +961,7 @@ class Gateway(BaseHTTPRequestHandler):
     # Served WITHOUT a login on purpose: a browser has to trust the CA before it can show
     # anything else, and a certificate is public information.
     ca_pem: bytes = b""
+    ca_fingerprint: str = ""
     failures: dict[str, list[float]] = {}
     failures_lock = threading.Lock()
 
@@ -527,13 +1004,20 @@ class Gateway(BaseHTTPRequestHandler):
         self._send(503, page)
 
     def _login_page(self, error: str = "", user: str = "root") -> bytes:
+        if self.ca_fingerprint:
+            cert = ('Certificate: <strong>KubeOS Cluster CA</strong> &middot; '
+                    f'<a href="/kubeos-ca.crt">download</a><br>'
+                    f'SHA-256 <code>{self.ca_fingerprint}</code><br>'
+                    'Browser warning? Import that file once as a trusted authority '
+                    '(on the node: <code>kubeos-trust-ca</code> prints the exact steps).')
+        else:
+            cert = "Certificate: this node serves a self-signed certificate (no cluster CA)."
         return (LOGIN_PAGE.replace("__HOST__", self.hostname)
-                .replace("__USER__", user).replace("__ERROR__", error)).encode()
+                .replace("__USER__", user).replace("__ERROR__", error)
+                .replace("__CERT__", cert)).encode()
 
     def _standalone_page(self) -> bytes:
-        _, detail = self.membership.snapshot()
-        return (STANDALONE_PAGE.replace("__HOST__", self.hostname)
-                .replace("__DETAIL__", detail or "")).encode()
+        return STANDALONE_PAGE.replace("__HOST__", self.hostname).encode()
 
     def _send_json(self, code: int, payload: dict) -> None:
         self._send(code, (json.dumps(payload) + "\n").encode(),
@@ -578,7 +1062,19 @@ class Gateway(BaseHTTPRequestHandler):
         """The detached machine's own view: itself, and a way back into a cluster."""
         if path == "/kubeos-standalone/state":
             state, detail = self.membership.snapshot()
-            self._send_json(200, {"state": state, "detail": detail, "node": self.hostname})
+            joining, join_detail = join_in_progress()
+            if joining:
+                state, detail = "joining", join_detail or "joining this machine to a cluster"
+            elif standalone_bringup_in_progress():
+                # The automatic rebuild (option A) is the other way this page's machine gets its
+                # dashboard back, and it used to show nothing while it ran.
+                state = "rebuilding"
+                detail = ("this machine is rebuilding its own one-node cluster; the dashboard "
+                          "comes back by itself when that is done")
+            remaining = self.membership.standalone_in()
+            self._send_json(200, {"state": state, "detail": detail, "node": self.hostname,
+                                  "standalone_in": remaining,
+                                  "standalone_after": self.membership.standalone_after})
             return
         if path == "/kubeos-standalone/node":
             self._console_request("GET", "/node")
@@ -801,8 +1297,32 @@ class Gateway(BaseHTTPRequestHandler):
                            content_type="application/json; charset=utf-8")
             return
 
+        if path == "/kubeos-node-health":
+            state, detail = self.membership.snapshot()
+            self._send_json(200, host_health(state, detail))
+            return
+
         if path.startswith("/kubeos-standalone"):
             self._standalone(path)
+            return
+
+        joining, join_detail = join_in_progress()
+        if joining:
+            # Announce the work instead of letting Headlamp paint its own red failure: the browser
+            # keeps a spinner and simply reloads into the dashboard once the node is Ready.
+            if self._is_websocket():
+                self._send(503, b"this machine is joining a cluster\n",
+                           content_type="text/plain; charset=utf-8")
+                return
+            wants_html = "text/html" in (self.headers.get("Accept") or "") or path == "/"
+            if self.command in ("GET", "HEAD") and wants_html:
+                step = join_detail or "waiting for the join to finish"
+                self._send(200, (JOINING_PAGE.replace("__HOST__", self.hostname)
+                                 .replace("__STEP__", step)).encode())
+            else:
+                self._send_json(503, {"state": "joining",
+                                      "error": "this machine is joining a cluster",
+                                      "detail": join_detail})
             return
 
         if self.membership.snapshot()[0] == "detached":
@@ -815,6 +1335,11 @@ class Gateway(BaseHTTPRequestHandler):
                 return
             wants_html = "text/html" in (self.headers.get("Accept") or "") or path == "/"
             if self.command in ("GET", "HEAD") and wants_html:
+                if standalone_bringup_in_progress():
+                    # Option A is running right now: a progress page, not the frozen-looking
+                    # "not part of a cluster" page whose machine is busy rebuilding itself.
+                    self._send(200, REBUILDING_PAGE.replace("__HOST__", self.hostname).encode())
+                    return
                 self._send(200, self._standalone_page())
             else:
                 self._send_json(503, {"error": "this machine is not part of a cluster",
@@ -859,6 +1384,9 @@ def main() -> int:
                         help="this node's console service, used by the detached page")
     parser.add_argument("--console-token-file", default="/etc/kubeos-dashboard/console.token",
                         help="the console token the detached page's join request needs")
+    parser.add_argument("--standalone-after", type=float, default=120.0,
+                        help="seconds a machine must be continuously removed from its cluster "
+                             "before it rebuilds itself as a standalone node (0 disables)")
     args = parser.parse_args()
 
     try:
@@ -879,14 +1407,18 @@ def main() -> int:
             Gateway.ca_pem = b""
     else:
         Gateway.ca_pem = b""
+    Gateway.ca_fingerprint = pem_fingerprint(Gateway.ca_pem) if Gateway.ca_pem else ""
 
     Gateway.sessions = Sessions(key, args.session_hours)
     Gateway.upstream_port = args.upstream_port
     Gateway.hostname = socket.gethostname()
     Gateway.console_port = args.console_port
     Gateway.console_token_file = args.console_token_file
-    Gateway.membership = Membership(args.kubeconfig, args.self_node or Gateway.hostname,
-                                    args.probe_interval)
+    Gateway.membership = Membership(
+        args.kubeconfig, args.self_node or Gateway.hostname, args.probe_interval,
+        standalone_after=args.standalone_after,
+        on_detached=lambda: request_standalone(args.console_port, args.console_token_file),
+    )
     Gateway.membership.start()
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
