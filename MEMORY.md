@@ -2056,3 +2056,10 @@ Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
   `kubeos-pod-routes` unit (see MEMORY of the KubeOS repo), and the dashboard needed no change for it. Lesson for this
   repo: "does the dashboard work on N nodes" and "does the platform work on N nodes" are different questions - the
   dashboard side was already count-agnostic, the evidence had to come from pods, not pages.
+
+- **2026-11-13 01:08 - published.** Both branches carry the same code: `development` and `main` = `7fd7747` (pushed at
+  the user's explicit request, one-off). **From now on the user's rule is: push `development` only, and only when they
+  ask** - "for this time only from next time pushing will happen to only development with my permission". Deliberately
+  left untracked: the user's `autherror.png` and the dead `src/nodesview.tsx` (never referenced from `index.tsx`; removing
+  it needs their word). The release tarball stays ignored (`/release/` in .gitignore) - it is build output, 50 MB
+  compressed / 123 MB unpacked.
