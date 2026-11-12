@@ -46,6 +46,7 @@ import secrets
 import select
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -237,9 +238,246 @@ Service: <code>systemctl status kubeos-dashboard</code> on this node.</p>
 """
 
 
+STANDALONE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KubeOS - __HOST__</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; background:#0b0b0b; color:#e8e8e8;
+         font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { width:min(94vw,780px); margin:0 auto; padding:34px 0 60px; }
+  .brand { display:flex; align-items:baseline; gap:10px; margin-bottom:22px; }
+  .brand b { color:#c4ff2e; letter-spacing:.14em; font-size:15px; }
+  .brand span { color:#6f7a6a; font-size:11px; letter-spacing:.18em; text-transform:uppercase; }
+  .card { background:#111312; border:1px solid rgba(196,255,46,.25); border-radius:10px;
+          padding:24px; margin-bottom:16px; }
+  h1 { font-size:17px; margin:0 0 10px; }
+  p { margin:8px 0; color:#c9cfc6; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:#9aa596; font-size:11px; font-weight:600; padding:4px 12px 4px 0;
+       width:150px; vertical-align:top; }
+  td { padding:4px 12px 4px 0; font-size:13px; }
+  .bad { color:#ff8080; } .good { color:#c4ff2e; } .dim { color:#8b968a; }
+  code { background:#0d0f0d; border:1px solid #23271f; border-radius:4px; padding:1px 5px; font-size:12px; }
+  textarea { width:100%; box-sizing:border-box; min-height:86px; padding:10px 12px; border-radius:6px;
+             border:1px solid #2a2f28; background:#0d0f0d; color:#e8e8e8;
+             font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; resize:vertical; }
+  textarea:focus { outline:none; border-color:#c4ff2e; }
+  button { margin-top:14px; padding:10px 18px; border:0; border-radius:6px; background:#c4ff2e;
+           color:#0b0b0b; font-weight:700; font-size:14px; cursor:pointer; }
+  button[disabled] { opacity:.45; cursor:default; }
+  .note { color:#8b968a; font-size:12px; border-top:1px solid #1d211c; margin-top:14px; padding-top:12px; }
+  .status { margin-top:12px; font-size:13px; min-height:20px; }
+</style></head>
+<body><div class="wrap">
+  <div class="brand"><b>KUBEOS</b><span>__HOST__</span></div>
+
+  <div class="card">
+    <h1>This machine is not part of a cluster</h1>
+    <p>The dashboard on <code>__HOST__</code> shows <strong>only this machine</strong>, because the
+       cluster it belonged to does not know it any more (its node record was removed). The other
+       machines are deliberately not shown here: that cluster is no longer this machine's.</p>
+    <p class="dim" id="detail">__DETAIL__</p>
+  </div>
+
+  <div class="card">
+    <h1>This machine</h1>
+    <table id="facts"><tr><th>state</th><td class="dim">reading&hellip;</td></tr></table>
+  </div>
+
+  <div class="card">
+    <h1>Join a cluster</h1>
+    <p>On any node of the target cluster, open its dashboard, go to <strong>Join node</strong> and copy
+       the string it shows. Paste it here to make this machine a worker of that cluster.</p>
+    <textarea id="bundle" spellcheck="false" autocapitalize="off"
+      placeholder="KOSJOIN1.&hellip;  or  kubeadm join 192.168.122.5:6443 --token &hellip;"></textarea>
+    <button id="join">Join this machine</button>
+    <div class="status" id="status"></div>
+    <p class="note">Joining discards this machine's own cluster and makes it a worker of the one whose
+       string you pasted. This page turns back into the dashboard by itself when that has happened.</p>
+  </div>
+</div>
+<script>
+(function () {
+  var el = function (id) { return document.getElementById(id); };
+  function row(key, value, cls) {
+    var tr = document.createElement('tr');
+    var th = document.createElement('th');
+    th.textContent = key;
+    var td = document.createElement('td');
+    td.textContent = value;
+    if (cls) { td.className = cls; }
+    tr.appendChild(th); tr.appendChild(td);
+    return tr;
+  }
+  function readFacts() {
+    var table = el('facts');
+    fetch('/kubeos-standalone/node', { headers: { 'Accept': 'application/json' } })
+      .then(function (answer) {
+        return answer.json().then(function (body) { return { ok: answer.ok, body: body }; });
+      })
+      .then(function (answer) {
+        table.innerHTML = '';
+        if (!answer.ok || answer.body.ok === false) {
+          throw new Error(answer.body.error || 'the console service refused the request');
+        }
+        var facts = answer.body;
+        table.appendChild(row('hostname', facts.hostname || '?'));
+        table.appendChild(row('addresses', (facts.addresses || []).join(', ') || '\u2014'));
+        table.appendChild(row('in a cluster', facts.member ? 'yes' : 'no',
+                              facts.member ? 'good' : 'bad'));
+        Object.keys(facts.units || {}).forEach(function (unit) {
+          table.appendChild(row(unit, facts.units[unit],
+                                facts.units[unit] === 'active' ? 'good' : 'dim'));
+        });
+      })
+      .catch(function (reason) {
+        table.innerHTML = '';
+        table.appendChild(row('this machine', String(reason.message || reason), 'bad'));
+      });
+  }
+  function pollState() {
+    fetch('/kubeos-standalone/state', { headers: { 'Accept': 'application/json' } })
+      .then(function (answer) { return answer.json(); })
+      .then(function (state) {
+        // Joined again: this page has nothing left to say, so hand the browser back to the
+        // dashboard. The membership probe is what notices, which is why it runs here too.
+        if (state.state === 'member') { window.location.reload(); return; }
+        if (state.detail) { el('detail').textContent = state.detail; }
+      })
+      .catch(function () {});
+  }
+  el('join').addEventListener('click', function () {
+    var bundle = el('bundle').value.trim();
+    var status = el('status');
+    if (!bundle) {
+      status.textContent = 'Paste the join string first.';
+      status.className = 'status bad';
+      return;
+    }
+    el('join').disabled = true;
+    status.className = 'status dim';
+    status.textContent = 'Starting the join on this machine\u2026';
+    fetch('/kubeos-standalone/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bundle: bundle })
+    })
+      .then(function (answer) {
+        return answer.json().then(function (body) { return { ok: answer.ok, body: body }; });
+      })
+      .then(function (answer) {
+        if (!answer.ok || answer.body.ok === false) {
+          throw new Error(answer.body.error || 'the join was refused');
+        }
+        status.className = 'status good';
+        status.textContent = 'The join is running as ' + (answer.body.unit || 'a systemd unit') +
+          '. This page reloads by itself when the machine is a node again.';
+      })
+      .catch(function (reason) {
+        status.className = 'status bad';
+        status.textContent = 'Could not start the join: ' + String(reason.message || reason);
+        el('join').disabled = false;
+      });
+  });
+  readFacts();
+  pollState();
+  window.setInterval(pollState, 5000);
+}());
+</script>
+</body></html>
+"""
+
+
+# --------------------------------------------------------------------------- membership
+KUBECTL = "/usr/bin/kubectl"
+DEFAULT_KUBECONFIG = "/etc/kubeos-dashboard/kubeconfig"
+
+
+class Membership:
+    """Is this machine still a NODE of the cluster its dashboard is configured for?
+
+    WHY THIS EXISTS (user report 2026-11-12, twice): after a node was removed from the cluster,
+    opening that machine's own dashboard showed the OTHER machine under Nodes - never itself.
+    The cause is not rendering: deleting a Node object does not revoke the dashboard's
+    credential, so `.6` keeps answering `kubectl get nodes` from `.5`'s API, and that list
+    ("kubeos1") is correct data about a cluster this machine is no longer part of. Proxmox does
+    not show this symptom because there the node's own state is local; here the only local truth
+    is "does the API still know my name", so that is what the gateway asks.
+
+    STATES, and why "unknown" is not "detached": a node whose API server is unreachable is still
+    a member (the control plane may be restarting). Only an explicit NotFound, or a credential
+    the API refuses, means "removed" - so unknown keeps exactly today's behaviour.
+    """
+
+    def __init__(self, kubeconfig: str, hostname: str, interval: float) -> None:
+        self.kubeconfig = kubeconfig or ""
+        self.hostname = hostname
+        self.interval = max(3.0, interval)
+        self.state = "unknown"
+        self.detail = "checking whether this machine is a node of a cluster"
+        self._lock = threading.Lock()
+
+    def _set(self, state: str, detail: str) -> None:
+        with self._lock:
+            if state != self.state:
+                log(f"membership: {self.state} -> {state} ({detail or 'no detail'})")
+            self.state = state
+            self.detail = detail
+
+    def snapshot(self) -> tuple[str, str]:
+        with self._lock:
+            return self.state, self.detail
+
+    def probe(self) -> None:
+        if not self.kubeconfig or not os.path.exists(self.kubeconfig):
+            self._set("unknown", f"no kubeconfig at {self.kubeconfig or '(none)'} to ask with")
+            return
+        if not os.path.exists(KUBECTL):
+            self._set("unknown", f"{KUBECTL} is not installed")
+            return
+        try:
+            done = subprocess.run(
+                [KUBECTL, "--kubeconfig", self.kubeconfig, "get", "node", self.hostname,
+                 "-o", "name", "--request-timeout=8s", "--cache-dir", "/tmp/kubeos-auth-cache"],
+                capture_output=True, text=True, timeout=30,
+                # The unit runs with ProtectHome=yes and ProtectSystem=strict, so kubectl must
+                # not try to read or write anything under $HOME; PrivateTmp=yes gives it a
+                # writable /tmp for its discovery cache.
+                env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as reason:
+            self._set("unknown", f"could not run kubectl ({reason})")
+            return
+        stderr = (done.stderr or "").strip()
+        if done.returncode == 0 and (done.stdout or "").strip():
+            self._set("member", "this machine is a node of the cluster its dashboard points at")
+        elif "NotFound" in stderr or "not found" in stderr:
+            self._set("detached", stderr.splitlines()[-1] if stderr
+                      else "the cluster does not know this node any more")
+        else:
+            # Unreachable API, TLS trouble, a refused login: unknowable, so leave the dashboard
+            # alone rather than pretend the machine was removed.
+            self._set("unknown", stderr.splitlines()[-1] if stderr
+                      else "the API server did not answer")
+
+    def _loop(self) -> None:
+        while True:
+            self.probe()
+            time.sleep(self.interval)
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, name="kubeos-membership", daemon=True).start()
+
+
 class Gateway(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "kubeos-auth"
+
+    membership: Membership
+    console_port: int = 30444
+    console_token_file: str = "/etc/kubeos-dashboard/console.token"
 
     sessions: Sessions
     upstream_port: int
@@ -291,6 +529,84 @@ class Gateway(BaseHTTPRequestHandler):
     def _login_page(self, error: str = "", user: str = "root") -> bytes:
         return (LOGIN_PAGE.replace("__HOST__", self.hostname)
                 .replace("__USER__", user).replace("__ERROR__", error)).encode()
+
+    def _standalone_page(self) -> bytes:
+        _, detail = self.membership.snapshot()
+        return (STANDALONE_PAGE.replace("__HOST__", self.hostname)
+                .replace("__DETAIL__", detail or "")).encode()
+
+    def _send_json(self, code: int, payload: dict) -> None:
+        self._send(code, (json.dumps(payload) + "\n").encode(),
+                   content_type="application/json; charset=utf-8")
+
+    def _console_request(self, method: str, path: str, body: bytes | None = None) -> None:
+        """Ask THIS node's console service, with its token - which never reaches the browser.
+
+        Server-side on purpose: the token is a root-PTY credential, the browser has no business
+        holding it, and this hop has no Origin header, so the console's same-origin rule (which
+        is what keeps every dashboard scoped to its own machine) is satisfied by construction.
+        """
+        token = ""
+        try:
+            with open(self.console_token_file, "r", encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except OSError as reason:
+            self._send_json(503, {"ok": False,
+                                  "error": f"the console token {self.console_token_file} is "
+                                           f"unreadable ({reason})"})
+            return
+        headers = {"Authorization": f"Bearer {token}", "Host": f"127.0.0.1:{self.console_port}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(body))
+        connection = http.client.HTTPSConnection("127.0.0.1", self.console_port, timeout=90,
+                                                 context=UPSTREAM_TLS)
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            payload = response.read()
+            status = response.status
+        except OSError as reason:
+            connection.close()
+            self._send_json(503, {"ok": False,
+                                  "error": f"this node's console service did not answer ({reason})"})
+            return
+        connection.close()
+        self._send(status, payload, content_type="application/json; charset=utf-8")
+
+    def _standalone(self, path: str) -> None:
+        """The detached machine's own view: itself, and a way back into a cluster."""
+        if path == "/kubeos-standalone/state":
+            state, detail = self.membership.snapshot()
+            self._send_json(200, {"state": state, "detail": detail, "node": self.hostname})
+            return
+        if path == "/kubeos-standalone/node":
+            self._console_request("GET", "/node")
+            return
+        if path == "/kubeos-standalone/join":
+            if self.command in ("GET", "HEAD"):
+                self._console_request("GET", "/action/join")
+                return
+            if self.command != "POST":
+                self._send_json(405, {"ok": False, "error": "POST a join string here"})
+                return
+            if self.membership.snapshot()[0] != "detached":
+                # A join wipes this machine's cluster. Only offer it when there is nothing left
+                # to wipe; otherwise the dashboard's own Join page is the right door.
+                self._send_json(409, {"ok": False,
+                                      "error": "this machine is already a node of a cluster - "
+                                               "open its dashboard and use Join node"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 32768:
+                self._send_json(400, {"ok": False, "error": "expected a small JSON body"})
+                return
+            self._console_request("POST", "/action/join", self.rfile.read(length))
+            return
+        if self.command in ("GET", "HEAD"):
+            self._send(200, self._standalone_page())
+            return
+        self._send_json(404, {"ok": False, "error": "not found"})
 
     def _rate_limited(self) -> bool:
         now = time.time()
@@ -463,6 +779,14 @@ class Gateway(BaseHTTPRequestHandler):
             self._send(200, self.ca_pem, content_type="application/x-x509-ca-cert",
                        extra=[("Content-Disposition", "attachment; filename=kubeos-ca.crt")])
             return
+        if path == "/kubeos-node":
+            # Which node is SERVING this page. Public on purpose: a hostname is not a secret
+            # and the login page needs it too. Without it a browser cannot tell "which node am
+            # I on" from "which cluster am I looking at" - the confusion that made a worker look
+            # like it had been replaced by the control plane (2026-11-12).
+            body = json.dumps({"node": self.hostname}).encode()
+            self._send(200, body, content_type="application/json; charset=utf-8")
+            return
         if path == "/healthz":
             self._send(200, b"ok\n", content_type="text/plain; charset=utf-8")
             return
@@ -476,6 +800,27 @@ class Gateway(BaseHTTPRequestHandler):
                 self._send(401, b'{"error":"not signed in"}\n',
                            content_type="application/json; charset=utf-8")
             return
+
+        if path.startswith("/kubeos-standalone"):
+            self._standalone(path)
+            return
+
+        if self.membership.snapshot()[0] == "detached":
+            # THIS MACHINE IS NOT IN A CLUSTER ANY MORE, so proxying Headlamp would show somebody
+            # else's cluster under its name - the exact report this exists to end ("after
+            # removed kubeos2 ... it shows only kubeos1"). Show the machine itself instead.
+            if self._is_websocket():
+                self._send(503, b"this machine is not part of a cluster\n",
+                           content_type="text/plain; charset=utf-8")
+                return
+            wants_html = "text/html" in (self.headers.get("Accept") or "") or path == "/"
+            if self.command in ("GET", "HEAD") and wants_html:
+                self._send(200, self._standalone_page())
+            else:
+                self._send_json(503, {"error": "this machine is not part of a cluster",
+                                      "node": self.hostname})
+            return
+
         self._proxy()
 
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
@@ -501,6 +846,19 @@ def main() -> int:
     parser.add_argument("--ca-file", default="",
                         help="CA certificate to offer at /kubeos-ca.crt, so a browser can "
                              "trust every node with one import")
+    parser.add_argument("--kubeconfig", default=DEFAULT_KUBECONFIG,
+                        help="the kubeconfig this node's dashboard uses; the gateway asks it "
+                             "whether the cluster still knows this machine's node name")
+    parser.add_argument("--self-node", default="",
+                        help="the node name to ask the cluster about (default: this hostname). "
+                             "An override exists so both branches can be exercised on a healthy "
+                             "cluster without removing a real node")
+    parser.add_argument("--probe-interval", type=float, default=10.0,
+                        help="seconds between membership probes (minimum 3)")
+    parser.add_argument("--console-port", type=int, default=30444,
+                        help="this node's console service, used by the detached page")
+    parser.add_argument("--console-token-file", default="/etc/kubeos-dashboard/console.token",
+                        help="the console token the detached page's join request needs")
     args = parser.parse_args()
 
     try:
@@ -525,6 +883,11 @@ def main() -> int:
     Gateway.sessions = Sessions(key, args.session_hours)
     Gateway.upstream_port = args.upstream_port
     Gateway.hostname = socket.gethostname()
+    Gateway.console_port = args.console_port
+    Gateway.console_token_file = args.console_token_file
+    Gateway.membership = Membership(args.kubeconfig, args.self_node or Gateway.hostname,
+                                    args.probe_interval)
+    Gateway.membership.start()
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2

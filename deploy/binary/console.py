@@ -563,6 +563,43 @@ class Handler(BaseHTTPRequestHandler):
             close_fds=True,
         )
 
+    # ---- this node's own facts --------------------------------------------
+    # The dashboard's Nodes section lists the CLUSTER, which cannot contain a node whose object
+    # was deleted (or that was never joined) - so the machine you are actually talking to had
+    # nowhere to appear, and on a detached worker the page looked like the control plane's
+    # (user: "why it not showing itself kubeos2 in nodes section", 2026-11-12). This answers
+    # "what is this machine" from the machine itself, and whether it is a member of the cluster.
+    NODE_UNITS = ("kubelet", "containerd", "kube-proxy",
+                  "kubeos-dashboard", "kubeos-dashboard-auth", "kubeos-console")
+    DASHBOARD_KUBECONFIG = "/etc/kubeos-dashboard/kubeconfig"
+
+    def _node_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        host = socket.gethostname()
+        units = {}
+        for unit in self.NODE_UNITS:
+            result = subprocess.run(["/usr/bin/systemctl", "is-active", unit],
+                                    capture_output=True, text=True, timeout=10)
+            units[unit] = (result.stdout or "").strip() or "unknown"
+        addresses = []
+        try:
+            addresses = socket.gethostbyname_ex(host)[2]
+        except OSError:
+            pass
+        member = None
+        if os.path.exists(self.DASHBOARD_KUBECONFIG):
+            probe = subprocess.run(
+                ["/usr/bin/kubectl", "--kubeconfig", self.DASHBOARD_KUBECONFIG,
+                 "get", "node", host, "-o",
+                 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'],
+                capture_output=True, text=True, timeout=25)
+            member = bool((probe.stdout or "").strip())
+        self._json(200, {"hostname": host, "addresses": addresses, "units": units,
+                         "member": member,
+                         "dashboard_kubeconfig": os.path.exists(self.DASHBOARD_KUBECONFIG)})
+
     # ---- joining this node to a cluster -----------------------------------
     JOIN_UNIT = "kubeos-node-join"
     JOIN_HELPER = "/usr/bin/kubeos-node-join"
@@ -669,6 +706,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/action/join":
             self._join_get()
+            return
+        if parsed.path == "/node":
+            self._node_get()
             return
         if parsed.path != "/ws":
             self.send_error(404)

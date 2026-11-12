@@ -64,6 +64,8 @@ CONSOLE_DIR=/usr/lib/kubeos-console
 CONSOLE_ENV=/etc/default/$CONSOLE_SERVICE
 CONSOLE_UNIT=/etc/systemd/system/$CONSOLE_SERVICE.service
 CONSOLE_TOKEN=$CONF_DIR/console.token
+# How often the login gateway re-asks whether this machine is still a node.
+PROBE_INTERVAL=10
 CONSOLE_SECRET=kubeos-console-token
 CONSOLE_PORT=30444
 DO_CONSOLE=1
@@ -492,9 +494,16 @@ fi
 if [ "$DO_LOGIN" -eq 1 ]; then
     {
         printf '# Written by kubeos-dashboard install.sh - re-run it to change the flags.\n'
-        printf 'AUTH_ARGS=--listen %s --port %s --upstream-port %s --tls-cert %s/tls.crt --tls-key %s/tls.key --session-key %s --session-hours %s --ca-file %s\n' \
+        # The membership flags matter: the gateway asks the API whether the cluster still knows
+        # THIS machine's node name, and when it does not, it shows this machine alone instead of
+        # proxying a cluster it is no longer part of. --console-port/--console-token-file serve
+        # the detached page's "Join a cluster" box from the node side, so the token never reaches
+        # a browser and the console's same-origin rule is satisfied (server requests carry no
+        # Origin header).
+        printf 'AUTH_ARGS=--listen %s --port %s --upstream-port %s --tls-cert %s/tls.crt --tls-key %s/tls.key --session-key %s --session-hours %s --ca-file %s --kubeconfig %s/kubeconfig --probe-interval %s --console-port %s --console-token-file %s\n' \
             "$LISTEN_ADDR" "$PORT" "$HEADLAMP_PORT" "$CONF_DIR" "$CONF_DIR" "$AUTH_SESSION_KEY" \
-            "$SESSION_HOURS" "$CA_CERT_FILE"
+            "$SESSION_HOURS" "$CA_CERT_FILE" "$CONF_DIR" "$PROBE_INTERVAL" "$CONSOLE_PORT" \
+            "$CONSOLE_TOKEN"
     } > "$AUTH_ENV"
     chmod 0644 "$AUTH_ENV"
     install -m 0644 "$SRC/systemd/$AUTH_SERVICE.service" "$AUTH_UNIT"
