@@ -6,8 +6,9 @@
  * the header. `registerAppBarAction` appends to Headlamp's own top bar, right of the
  * settings and user icons.
  *
- * HOW A BUTTON CAN POWER OFF A NODE FROM A POD: the dashboard runs as a Pod and has no
- * access to the host's systemd. Each action therefore creates a ONE-SHOT privileged Pod
+ * HOW A BROWSER BUTTON CAN POWER OFF A NODE: the page talks to headlamp-server, which only
+ * proxies Kubernetes API calls - it exposes no way to run a command on the host, and it
+ * must not (it runs as an unprivileged user). So each action creates a ONE-SHOT privileged Pod
  * in kubeos-system that shares the host PID namespace and mounts the host filesystem at
  * /host, then asks the host's OWN systemd to do the work:
  *
@@ -23,8 +24,10 @@
  *     down again, for ever. A bare Pod with `Never` is not restarted after a reboot.
  *   * an idempotency marker in /var/lib/kubeos keyed by Pod name: if the same Pod ever
  *     runs twice, the second run exits without touching systemd.
- *   * Power off requires typing the node's name; Restart is a plain confirmation, since
- *     it is routine and the node comes back.
+ *   * BOTH actions are a plain confirmation - no typed node name (user decision 2026-11-12).
+ *     The dialog spells out the consequence instead, and Power off stays the red button; a
+ *     single-node appliance gains nothing from making the operator retype what the dialog
+ *     already says.
  *   * the Pod is pinned to the node it was created for (nodeSelector on the hostname),
  *     so nothing can land on the wrong machine if a second node ever joins.
  *
@@ -65,7 +68,6 @@ import Dialog from "@mui/material/Dialog";
 import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
-import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import React from "react";
 import { BRAND } from "./brand";
@@ -98,6 +100,50 @@ async function apiJson<T>(path: string): Promise<T> {
 async function readNodeName(): Promise<string> {
   const list = await apiJson<{ items: any[] }>("/api/v1/nodes");
   return list?.items?.[0]?.metadata?.name ?? "";
+}
+
+/** Actions whose one-shot Pods are finished with, whatever terminal phase they reached. */
+const ACTION_LABELS = ["restart", "poweroff"];
+
+/**
+ * Delete the one-shot action Pods left behind by earlier clicks.
+ *
+ * A power off kills the node before anything can remove its own Pod, so the API server is
+ * left holding the object and later marks it Unknown/Failed - for ever, unless somebody
+ * deletes it (measured 2026-11-12: three of them, one 12 hours old). Nothing in the cluster
+ * owns them, so the dashboard sweeps them itself whenever it loads, which is exactly the
+ * moment after the node comes back. Restart leaves the same debris for the same reason.
+ */
+async function sweepStaleActionPods(): Promise<number> {
+  const list = await apiJson<{ items: any[] }>(
+    `/api/v1/namespaces/${NAMESPACE}/pods`
+  );
+  const stale = (list?.items ?? []).filter((pod) => {
+    const action = pod?.metadata?.labels?.["kubeos.in/action"];
+    const phase = pod?.status?.phase;
+    return (
+      ACTION_LABELS.includes(action) &&
+      (phase === "Succeeded" || phase === "Failed" || phase === "Unknown")
+    );
+  });
+  let removed = 0;
+  for (const pod of stale) {
+    const name = pod?.metadata?.name;
+    if (!name) {
+      continue;
+    }
+    try {
+      await ApiProxy.remove(`/api/v1/namespaces/${NAMESPACE}/pods/${name}`);
+      removed += 1;
+    } catch {
+      // Not fatal: an unreachable node, a permission problem or a race with another tab
+      // simply means the next load tries again.
+    }
+  }
+  if (removed > 0) {
+    console.log(`kubeos: removed ${removed} finished node-action pod(s)`);
+  }
+  return removed;
 }
 
 /** Cluster name from the URL, which is how every Headlamp route is scoped. */
@@ -147,6 +193,13 @@ function actionPod(action: PowerAction, node: string) {
       // boot. A Pod with `Never` is not restarted once the container has exited.
       restartPolicy: "Never",
       hostPID: true,
+      // This Pod never talks to the API: it runs one nsenter. Without a service-account
+      // token the kubelet skips the projected `kube-api-access-*` volume entirely, which
+      // removes a whole class of start-up failure - measured 2026-11-12: after a reboot the
+      // kubelet retried these Pods and logged `MountVolume.SetUp failed ... object
+      // "kubeos-system"/"kube-root-ca.crt" not registered`, i.e. the Pod's start depended on
+      // a ConfigMap it does not need. POD_NAME still arrives through the downward API.
+      automountServiceAccountToken: false,
       nodeSelector: { "kubernetes.io/hostname": node },
       tolerations: [{ operator: "Exists" }],
       containers: [
@@ -354,12 +407,10 @@ function NodeActionDialog({
   onClose: () => void;
   onDone: (message: string) => void;
 }) {
-  const [typed, setTyped] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    setTyped("");
     setBusy(false);
     setError(null);
   }, [action]);
@@ -368,9 +419,9 @@ function NodeActionDialog({
     return null;
   }
   const isPowerOff = action === "poweroff";
-  // Restart is routine (the node comes back); power off leaves the machine dark until
-  // somebody walks up to it, so only that one demands the name typed out.
-  const canSubmit = !busy && (!isPowerOff || typed === node);
+  // One click plus one explicit confirmation (user decision 2026-11-12): the consequences are
+  // spelled out in the body, so typing the node name was friction, not safety.
+  const canSubmit = !busy;
 
   const submit = async () => {
     setBusy(true);
@@ -408,19 +459,10 @@ function NodeActionDialog({
           sx={{ display: "block", color: BRAND.text.muted, mb: 2 }}
         >
           The request goes to the node&apos;s own systemd through a short-lived
-          privileged Pod; the Pod is deleted when the node goes down and is not
-          restarted, so this cannot loop.
+          privileged Pod, because a browser cannot reach the host any other way. The Pod is
+          never restarted (so this cannot loop) and it is removed automatically the next time
+          the dashboard loads.
         </Typography>
-        {isPowerOff && (
-          <TextField
-            label={`Type ${node} to confirm`}
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-            fullWidth
-            margin="dense"
-            inputProps={{ autoComplete: "off" }}
-          />
-        )}
         {error && (
           <Typography
             variant="body2"
@@ -474,6 +516,9 @@ function NodeActions() {
     readNodeName()
       .then(setNode)
       .catch(() => setNode(""));
+    // Housekeeping, not part of the button: clear the finished action Pods of earlier
+    // clicks (see sweepStaleActionPods).
+    sweepStaleActionPods().catch(() => {});
   }, []);
 
   const openShell = async () => {
