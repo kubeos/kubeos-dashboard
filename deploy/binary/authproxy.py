@@ -208,6 +208,35 @@ LOGIN_PAGE = """<!doctype html>
 """
 
 
+BUSY_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="15">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KubeOS - this node is busy</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0b0b0b; color:#e8e8e8; font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .card { width:min(92vw,520px); background:#111312; border:1px solid rgba(196,255,46,.25);
+          border-radius:10px; padding:26px; }
+  b { color:#c4ff2e; letter-spacing:.14em; font-size:14px; }
+  h1 { font-size:16px; margin:18px 0 8px; }
+  p { margin:8px 0; color:#c9cfc6; }
+  code { background:#0d0f0d; border:1px solid #23271f; border-radius:4px; padding:1px 5px; font-size:12px; }
+  .note { color:#8b968a; font-size:12px; border-top:1px solid #1d211c; margin-top:16px; padding-top:12px; }
+  a { color:#c4ff2e; }
+</style></head><body><div class="card">
+<b>KUBEOS</b>
+<h1>The dashboard on this node is restarting</h1>
+<p>The node's own one-node cluster is being stopped, or the dashboard is starting up again.
+If you just pressed <strong>Join this node</strong>, this is expected and lasts about a minute -
+the node is discarding its own cluster and joining the one whose token you pasted.</p>
+<p>This page reloads itself every 15 seconds, or <a href="/">try now</a>.</p>
+<p class="note">Reason from the gateway: __REASON__<br>
+Service: <code>systemctl status kubeos-dashboard</code> on this node.</p>
+</div></body></html>
+"""
+
+
 class Gateway(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "kubeos-auth"
@@ -244,6 +273,20 @@ class Gateway(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _busy(self, reason: str) -> None:
+        """Headlamp is not answering: during a join that is normal, so say so instead of 502."""
+        wants_json = (
+            self.path.startswith("/clusters/")
+            and "text/html" not in (self.headers.get("Accept") or "")
+        )
+        log(f"{self.client_address[0]} upstream is down ({reason}) - serving the busy page")
+        if wants_json:
+            self._send(503, b'{"error":"the dashboard on this node is restarting"}\n',
+                       content_type="application/json; charset=utf-8")
+            return
+        page = BUSY_PAGE.replace("__REASON__", reason).encode()
+        self._send(503, page)
 
     def _login_page(self, error: str = "", user: str = "root") -> bytes:
         return (LOGIN_PAGE.replace("__HOST__", self.hostname)
@@ -330,8 +373,7 @@ class Gateway(BaseHTTPRequestHandler):
             response = connection.getresponse()
         except OSError as reason:
             connection.close()
-            self._send(502, f"the dashboard is not answering: {reason}\n".encode(),
-                       content_type="text/plain; charset=utf-8")
+            self._busy(str(reason))
             return
 
         self.send_response(response.status, response.reason)

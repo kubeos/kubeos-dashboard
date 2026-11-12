@@ -1713,6 +1713,18 @@ replaces the cluster-wide token with that node's and breaks the first node's bro
 token file to node 2 before installing; the code change is for `install.sh` to adopt the token **from the Secret** when
 its local file is absent (not yet written).
 
+**The "bad gateway" a user sees during a join is the join itself, and the gateway now says so (2026-11-12 17:35).** On
+the fresh pair the user's token join worked (kubeos2 registered and went Ready) but the browser showed a bare
+**502** for the ~minute between "the node's own cluster is stopped" and "the join finished and the dashboard was
+re-pointed" — `kubeos-auth: GET /clusters/main/healthz 502` while `headlamp` was alive but its old API server was
+gone. `_busy()` now answers that window with a branded **503** page ("The dashboard on this node is restarting",
+auto-reload every 15 s, says explicitly that a Join does this on purpose) while API paths still get JSON, so the
+frontend shows "reconnecting" instead of a crash. Verified by stopping `kubeos-dashboard` and re-requesting: page 503
++ friendly text + refresh meta, API 503 + `{"error":"the dashboard on this node is restarting"}`, then the unit came
+back and `/` answered again. Release `7d3f8419…`. **Honest limit:** the re-point only copies the kubeconfig, so a
+joined node keeps the certificate it had until `install.sh` runs on it (that is what makes it adopt the cluster CA and
+get every node IP in its SAN) — the ISO shipping `install.sh` would close that.
+
 **A join now ends with the joining node's dashboard already correct (2026-11-12 16:20).** The "Failed to get
 authentication information" page was never a login bug: after `kubeadm reset` the node's dashboard pointed at the
 cluster that had just been deleted, and a worker holds only a kubelet identity, so it cannot fix itself. The control
