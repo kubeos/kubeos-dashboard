@@ -1595,3 +1595,21 @@ Not touched, deliberately: the ISO artwork (`config/bootloaders/{grub-pc,isolinu
 `config/includes.binary/isolinux/splash.png`, the plymouth `splash.png`) also carries the MFZ wordmark in the old
 colour. That is a different surface with a rebuild attached - ask before changing it.
 Screenshot: `~/.kubeos-vm/harness/logo-after.png` (before/after: `logo-before-after.png`).
+
+### Session 2026-11-12 — pushed to `development` AND `main`
+
+User: *"ok good.. now push to development and main branch too"*. That is the per-message permission `AGENTS.md` §3 rule 5
+asks for, so `main` moved for the first time since the freeze: **both branches are now `6c71af0`**.
+
+- `6c71af0` **feat(console): no Pods for Shell, Restart or Power off; brand: MFZ in the KUBEOS lime** — 17 files:
+  the new `deploy/binary/console.py` + `kubeos-console.service`, the plugin's rewritten `nodeactions.tsx` (no Pod
+  specs left), `install.sh`/`uninstall.sh`/`build-binary.sh`, `README.md`, `BUILD.md`, `AGENTS.md`, the recoloured
+  `mark.png`/`favicon.png`, regenerated `assets.ts`, and the built `dist/`.
+- `main` was a strict ancestor of `development` (0 commits the other way), so `git push origin development:main` was a
+  plain fast-forward — no merge, no force. The local `main` ref was then moved with `git update-ref`, because the push
+  only updates the remote.
+- Pushed with `GIT_SSH_COMMAND='ssh -F /dev/null -i ~/.ssh/id_ed25519_skmdab -o IdentitiesOnly=yes …'`; the known
+  "update_ref failed … Read-only file system" message did **not** appear this time, and `git ls-remote` confirmed both
+  refs at `6c71af0`.
+- **Rule reminder for future sessions:** §3 rule 5 still stands — *earlier permission does not carry over*, `main`
+  moves only when the user says so in that message.
