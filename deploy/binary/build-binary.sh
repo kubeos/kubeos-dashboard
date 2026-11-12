@@ -116,20 +116,17 @@ fetch_layer() { # fetch_layer <digest> <file>
 # ---- inputs -------------------------------------------------------------
 [ -s "$PLUGIN_DIST/main.js" ] || die "no plugin bundle at $PLUGIN_DIST/main.js - run: cd kubeos-branding && npm run build"
 
-# Is dist/main.js older than src/? mtimes cannot answer that: git gives every file the
-# checkout time, so in a fresh clone src/*.tsx can look "newer" than dist and the mtime
-# test produced a false warning (found by cloning this repo and building it). Ask git,
-# and keep the mtime comparison only for a tree that is not a git checkout.
+# Is dist/main.js older than src/? Two things make the naive test wrong:
+#   * in a fresh clone every file gets the checkout time, so a src file can land a few
+#     milliseconds *after* dist/main.js and the committed release is called stale;
+#   * uncommitted edits under src/ are not staleness by themselves - 2026-11-12 this
+#     warned on a release that had just been rebuilt from those very edits, because the
+#     git branch below only asked "is src dirty".
+# So ask the build's own mtimes and tolerate a 2 s checkout skew.
 plugin_is_stale() {
-    if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-        # Uncommitted edits under src/ are the common case.
-        [ -n "$(git -C "$REPO" status --porcelain -- kubeos-branding/src 2>/dev/null)" ] && return 0
-        src_t=$(git -C "$REPO" log -1 --format=%ct -- kubeos-branding/src 2>/dev/null || true)
-        dist_t=$(git -C "$REPO" log -1 --format=%ct -- kubeos-branding/dist 2>/dev/null || true)
-        [ "${src_t:-0}" -gt "${dist_t:-0}" ] && return 0
-        return 1
-    fi
-    [ -n "$(find "$REPO/kubeos-branding/src" \( -name '*.tsx' -o -name '*.ts' \) -newer "$PLUGIN_DIST/main.js" 2>/dev/null | head -1)" ]
+    dist_t=$(stat -c %Y "$PLUGIN_DIST/main.js" 2>/dev/null) || return 1
+    [ -n "$(find "$REPO/kubeos-branding/src" \( -name '*.tsx' -o -name '*.ts' \) \
+        -newermt "@$((dist_t + 2))" 2>/dev/null | head -1)" ]
 }
 plugin_is_stale &&
     log "WARNING: kubeos-branding/src is newer than dist/main.js - the release would ship an old plugin"
@@ -165,7 +162,8 @@ fi
 # ---- assemble -----------------------------------------------------------
 log "assembling $NAME"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos-branding" "$STAGE/systemd"
+mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos-branding" \
+    "$STAGE/systemd" "$STAGE/console"
 
 TMP=$CACHE/extract
 rm -rf "$TMP"; mkdir -p "$TMP"
@@ -181,6 +179,10 @@ cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kube
 
 cp "$HERE/install.sh" "$HERE/uninstall.sh" "$STAGE/"
 cp "$HERE/kubeos-dashboard.service" "$HERE/kubeos-dashboard.env.example" "$STAGE/systemd/"
+cp "$HERE/kubeos-console.service" "$STAGE/systemd/"
+# The host console: the node's own PTY over TLS, so the Shell button creates no Pod.
+cp "$HERE/console.py" "$STAGE/console/console.py"
+chmod 0644 "$STAGE/console/console.py"
 cp "$HERE/README.md" "$STAGE/"
 chmod 0755 "$STAGE/install.sh" "$STAGE/uninstall.sh"
 # We redistribute upstream's binary, so upstream's licence and notice travel with it.

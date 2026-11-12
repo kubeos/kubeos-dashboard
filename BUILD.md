@@ -60,6 +60,8 @@ elsewhere, including older versions of this document.)
 | `wget` **or** `curl` | only for the post-install readiness check (a KubeOS node has `wget` only) |
 | `ip` | only for the certificate SAN and the final URL line |
 | free port | `30443` by default; it must not already be taken |
+| free port | `30444` by default, for the host console (the Shell button); must also be free |
+| `python3` | the host console is a standard-library Python service; a KubeOS node has it |
 
 ---
 
@@ -168,6 +170,8 @@ half-installed service is not a state you can end up in.
 | `--tls-cert` / `--tls-key` | self-signed | use an existing certificate (give both) |
 | `--san <entry>` | — | extra SAN, repeatable, e.g. `--san 'IP:10.0.0.5' --san 'DNS:dash.lan'` |
 | `--context-name <name>` | `main` | cluster id in every URL (`/c/<name>/…`) |
+| `--console-port <n>` | `30444` | HTTPS port of the host console (what the Shell button connects to) |
+| `--no-console` | — | do not install the host console; the Shell button then reports it is missing |
 | `--no-start` | — | install and enable, but do not start now |
 
 Re-running `install.sh` is the **upgrade path**: it replaces the binary, frontend and plugin, keeps
@@ -284,6 +288,9 @@ and one modified byte aborts the build with the expected and actual hash.
 | `ERROR: digest mismatch for …vendor/headlamp/…` | vendored file corrupted or edited | `cd vendor/headlamp/v0.46.0 && sha256sum -c SHA256SUMS`, restore with `git checkout -- vendor/` |
 | `WARNING: no HTTP 200 yet` | port busy, or the certificate/kubeconfig unreadable | `ss -lntp \| grep 30443`, then `journalctl -u kubeos-dashboard -n 40` |
 | `curl: command not found` | a KubeOS node ships `wget`, not `curl` | use the `wget` forms in §0 and §6, or run `curl` from another machine |
+| Shell button says *could not reach the host console* | this browser never accepted the certificate of port 30444 - browsers refuse a WebSocket to an untrusted certificate and show no warning | open `https://<node>:30444/` once, accept the warning, press Shell again |
+| Shell button says *the host console is not installed* | `--no-console` was used, or the Secret was not published | re-run `install.sh` (it publishes `kubeos-system/kubeos-console-token`), then `kubectl -n kubeos-system get secret kubeos-console-token` |
+| `WARNING: the host console did not answer` | port 30444 busy, or the token/certificate unreadable | `ss -lntp \| grep 30444`, then `journalctl -u kubeos-console -n 40` |
 | service `failed`, `ConditionPathExists` | kubeconfig or certificate missing | re-run `install.sh` |
 | page loads but every list is empty | the kubeconfig cannot reach the API | `kubectl --kubeconfig /etc/kubeos-dashboard/kubeconfig get --raw=/version` |
 | `Forbidden … subresource(s)=[proxy]` on Logs/Exec | the identity lacks `nodes/proxy` | grant it (kubeadm normally does via `system-api:apiserver-kubelet-client`); see `~/KubeOS` notes |

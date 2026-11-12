@@ -6,31 +6,23 @@
  * the header. `registerAppBarAction` appends to Headlamp's own top bar, right of the
  * settings and user icons.
  *
- * HOW A BROWSER BUTTON CAN POWER OFF A NODE: the page talks to headlamp-server, which only
- * proxies Kubernetes API calls - it exposes no way to run a command on the host, and it
- * must not (it runs as an unprivileged user). So each action creates a ONE-SHOT privileged Pod
- * in kubeos-system that shares the host PID namespace and mounts the host filesystem at
- * /host, then asks the host's OWN systemd to do the work:
+ * HOW A BROWSER BUTTON REACHES THE HOST, NOW: it does not go through the cluster at all. The
+ * node runs `kubeos-console.service` (deploy/binary/console.py) as root, listening on its own
+ * TLS port, and every button is a request to it - `POST /action/restart`,
+ * `POST /action/poweroff`, and a WebSocket for the shell. Until 2026-11-12 each action created
+ * a one-shot privileged Pod in kubeos-system that nsentered into PID 1 to run systemctl; the
+ * user's rule from that day is that **no button may create a Pod, now or later**, and this
+ * file no longer can: it holds no Pod spec at all.
  *
- *     nsenter -t 1 -m -u -i -n -p -- /usr/bin/systemctl reboot
- *
- * with `chroot /host /usr/bin/systemctl ...` as the fallback. The image is the
- * join-helper already required by the "Join node" page, which ships nsenter and chroot -
- * no new image, and it works offline.
- *
- * SAFETY, because a stray reboot destroys more than a dashboard session:
- *   * `restartPolicy: Never` on purpose, NOT a Job. A Job whose Pod dies with the node
- *     is a reboot loop: the Job controller re-creates it, it runs again, the node goes
- *     down again, for ever. A bare Pod with `Never` is not restarted after a reboot.
- *   * an idempotency marker in /var/lib/kubeos keyed by Pod name: if the same Pod ever
- *     runs twice, the second run exits without touching systemd.
- *   * BOTH actions are a plain confirmation - no typed node name (user decision 2026-11-12).
- *     The dialog spells out the consequence instead, and Power off stays the red button; a
- *     single-node appliance gains nothing from making the operator retype what the dialog
- *     already says.
- *   * the Pod is pinned to the node it was created for (nodeSelector on the hostname),
- *     so nothing can land on the wrong machine if a second node ever joins.
- *
+ * THE CONSEQUENCES THAT REMAIN TRUE, and why the design is still careful:
+ *   * Restart and Power off are a plain confirmation - no typed node name (user decision
+ *     2026-11-12). The dialog spells out the consequence instead, and Power off stays the
+ *     red button; a single-node appliance gains nothing from making the operator retype what
+ *     the dialog already says.
+ *   * The console refuses a second action while one is in flight (`409 already running`), so
+ *     a double click cannot queue two shutdowns.
+ *   * The answer must reach the browser BEFORE the machine goes down; console.py replies 202
+ *     first and only then runs systemctl, in a detached session.
  * WHY THE SHELL IS AN "ACTIVITY" AND NOT A `?view=exec` LINK (measured 2026-11-11): the
  * obvious one-click shell is a deep link to Headlamp's Pod page,
  *     /c/main/pods/kubeos-system/<pod>?view=exec&container=<c>
@@ -43,25 +35,25 @@
  * does: `Activity.launch()` with Headlamp's exported `Terminal`. Deep links must stay
  * out of KubeOS until upstream fixes the effect.
  *
- * WHAT THE SHELL IS, EXACTLY (stated in the UI too): an exec into a privileged container
- * that mounts the host at /host - so you start in the container, and
- *     nsenter -t 1 -m -u -i -n -p -- /bin/bash
- * gives you the host. Headlamp's own node shell does the same thing, and being honest
- * about it beats a button that pretends to be something it is not.
+ * WHAT THE SHELL IS, EXACTLY: the node's own login shell, with no Pod, no exec and no
+ * container in the path (user decision 2026-11-12: *"i need shell without pod creation"*).
+ * The node runs `kubeos-console.service`, a small PTY-over-WebSocket service; this file opens
+ * a WebSocket to it and paints an xterm. The earlier design - a privileged Pod plus an
+ * exec plus a `/bin/bash` wrapper that nsentered into PID 1 - is gone, along with the
+ * "Opening a shell…" delay and the container dropdown Headlamp drew over the terminal.
  *
- * AND IT DOES NOT LIVE FOR EVER: a privileged container with host root mounted is not
- * something to leave parked in the cluster. The Pod is created on the click, deleted when
- * the terminal reports it closed, and in any case expires after an hour
- * (activeDeadlineSeconds) - measured: closing the activity with its own ✕ does NOT call
- * the terminal's onClose, so the deadline is the part that actually guarantees cleanup.
+ * AND NOTHING IS LEFT BEHIND: closing the terminal closes the WebSocket, and the console
+ * hangs up the shell with it. The only cleanup left in this file is the sweep that removes a
+ * `kubeos-node-shell` Pod if an older dashboard created one.
  */
 import {
   Activity,
   ApiProxy,
-  CommonComponents,
-  K8s,
   registerAppBarAction,
 } from "@kinvolk/headlamp-plugin/lib";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import Dialog from "@mui/material/Dialog";
@@ -74,20 +66,18 @@ import { BRAND } from "./brand";
 
 const NAMESPACE = "kubeos-system";
 /**
- * The join-helper image is already on every KubeOS node (the Join node page needs it)
- * and ships both `nsenter` and `chroot`. Reusing it keeps the offline promise: no image
- * to pull for a button that must work when the network does not.
+ * The Pod name the shell USED to create. Nothing creates it any more (the shell is a node
+ * service now, see the console section below), but a dashboard deployed before 2026-11-12
+ * can leave one behind - a privileged container with the host's root filesystem mounted,
+ * waiting for its one-hour deadline. The sweep on page load deletes it.
  */
-const HELPER_IMAGE = "ghcr.io/skmdab/kubeos-join-helper:0.1.0";
 const SHELL_POD = "kubeos-node-shell";
-const SHELL_CONTAINER = "shell";
 const SHELL_ACTIVITY_ID = "kubeos-node-shell";
-const MANAGED_BY = { "app.kubernetes.io/managed-by": "kubeos-dashboard" };
+/** Where the node's host console listens (installed by deploy/binary/install.sh). */
+const CONSOLE_PORT = 30444;
+/** The Secret install.sh publishes the console token into. */
+const CONSOLE_SECRET = "kubeos-console-token";
 
-// Headlamp exports the Pod class and its own terminal; using them keeps this feature a
-// thin wrapper instead of a second xterm implementation.
-const PodClass = K8s.ResourceClasses.Pod;
-const Terminal = CommonComponents.Terminal;
 
 type PowerAction = "restart" | "poweroff";
 
@@ -102,7 +92,11 @@ async function readNodeName(): Promise<string> {
   return list?.items?.[0]?.metadata?.name ?? "";
 }
 
-/** Actions whose one-shot Pods are finished with, whatever terminal phase they reached. */
+/**
+ * Actions whose one-shot Pods are finished with. Nothing creates these any more (2026-11-12:
+ * the buttons POST to the node console), so this exists only to clear the debris of an older
+ * dashboard that is still deployed on a node.
+ */
 const ACTION_LABELS = ["restart", "poweroff"];
 
 /**
@@ -146,6 +140,42 @@ async function sweepStaleActionPods(): Promise<number> {
   return removed;
 }
 
+/**
+ * The shell's half of the same housekeeping.
+ *
+ * Closing the terminal deletes the Pod, but closing the ACTIVITY with its own ✕ never
+ * calls the terminal's onClose (measured 2026-11-11), so a privileged container with the
+ * host's root filesystem mounted can sit in the cluster until `activeDeadlineSeconds` (one
+ * hour) runs out - seen again on 2026-11-12 after a browser test was simply closed. A Pod
+ * that exists while no terminal is open cannot belong to a live session, so it is debris
+ * and loading the dashboard removes it.
+ */
+async function sweepLeftoverShellPod(): Promise<void> {
+  const path = `/api/v1/namespaces/${NAMESPACE}/pods/${SHELL_POD}`;
+  const existing: any = await apiJson(path).catch(() => null);
+  if (!existing) {
+    return;
+  }
+  await ApiProxy.remove(path);
+  console.log("kubeos: removed a leftover node shell pod");
+}
+
+/**
+ * Run the housekeeping exactly once per page load, and let the Shell button wait for it:
+ * otherwise a click in the same second as the page load could delete the Pod the click
+ * just created.
+ */
+let housekeeping: Promise<unknown> | null = null;
+function runHousekeeping(): Promise<unknown> {
+  if (!housekeeping) {
+    housekeeping = Promise.all([
+      sweepStaleActionPods().catch(() => 0),
+      sweepLeftoverShellPod().catch(() => undefined),
+    ]);
+  }
+  return housekeeping;
+}
+
 /** Cluster name from the URL, which is how every Headlamp route is scoped. */
 function currentCluster(): string {
   const match = window.location.pathname.match(/^\/c\/([^/]+)/);
@@ -153,243 +183,268 @@ function currentCluster(): string {
 }
 
 /**
- * The script the one-shot Pod runs. `set -eu` so a failed nsenter cannot look like
- * success, and the marker is written BEFORE the shutdown request: if systemd takes the
- * machine down mid-command the container is killed, but the Pod can never run the same
- * shutdown twice.
- */
-function actionScript(action: PowerAction): string {
-  // The UI calls it "Restart" and the systemd verb is "reboot": `systemctl restart` is a
-  // UNIT verb and, given no unit, answers only "Too few arguments." - which is exactly what
-  // the first real test printed while the node happily stayed up (2026-11-11).
-  const verb = action === "restart" ? "reboot" : "poweroff";
-  return [
-    "set -eu",
-    `MARK="/host/var/lib/kubeos/.kubeos-${verb}-$POD_NAME"`,
-    'if [ -e "$MARK" ]; then echo "already requested: $MARK"; exit 0; fi',
-    "mkdir -p /host/var/lib/kubeos",
-    ': > "$MARK"',
-    `echo "requesting ${verb} through the host systemd"`,
-    // nsenter first: it enters PID 1's mount namespace, so the binary is the HOST's
-    // systemctl and it talks to the HOST's systemd. chroot is the fallback for an
-    // image without nsenter.
-    `nsenter -t 1 -m -u -i -n -p -- /usr/bin/systemctl ${verb} || chroot /host /usr/bin/systemctl ${verb}`,
-  ].join("\n");
-}
-
-function actionPod(action: PowerAction, node: string) {
-  return {
-    apiVersion: "v1",
-    kind: "Pod",
-    metadata: {
-      // Unique per click: a fixed name would collide with the Pod left over from a
-      // previous reboot, and `create` would fail to report anything useful.
-      name: `kubeos-node-${action}-${Date.now()}`,
-      namespace: NAMESPACE,
-      labels: { ...MANAGED_BY, "kubeos.in/action": action },
-    },
-    spec: {
-      // Never, not a Job - see the header: a Job would reboot the node again on every
-      // boot. A Pod with `Never` is not restarted once the container has exited.
-      restartPolicy: "Never",
-      hostPID: true,
-      // This Pod never talks to the API: it runs one nsenter. Without a service-account
-      // token the kubelet skips the projected `kube-api-access-*` volume entirely, which
-      // removes a whole class of start-up failure - measured 2026-11-12: after a reboot the
-      // kubelet retried these Pods and logged `MountVolume.SetUp failed ... object
-      // "kubeos-system"/"kube-root-ca.crt" not registered`, i.e. the Pod's start depended on
-      // a ConfigMap it does not need. POD_NAME still arrives through the downward API.
-      automountServiceAccountToken: false,
-      nodeSelector: { "kubernetes.io/hostname": node },
-      tolerations: [{ operator: "Exists" }],
-      containers: [
-        {
-          name: "action",
-          image: HELPER_IMAGE,
-          imagePullPolicy: "IfNotPresent",
-          securityContext: { privileged: true },
-          env: [
-            {
-              name: "POD_NAME",
-              valueFrom: { fieldRef: { fieldPath: "metadata.name" } },
-            },
-          ],
-          volumeMounts: [{ name: "host", mountPath: "/host" }],
-          command: ["/bin/sh", "-c", actionScript(action)],
-        },
-      ],
-      volumes: [{ name: "host", hostPath: { path: "/" } }],
-    },
-  };
-}
-
-function shellPod(node: string) {
-  return {
-    apiVersion: "v1",
-    kind: "Pod",
-    metadata: {
-      name: SHELL_POD,
-      namespace: NAMESPACE,
-      labels: { ...MANAGED_BY, "kubeos.in/action": "shell" },
-    },
-    spec: {
-      restartPolicy: "Always",
-      hostPID: true,
-      // Backstop: this container is privileged and has the host's root filesystem
-      // mounted, so it must never sit in the cluster unattended. Closing the terminal
-      // deletes it (closeShellActivity), but an activity closed with its own ✕ does not
-      // call the terminal's onClose, so an hour is the hard limit.
-      activeDeadlineSeconds: 3600,
-      nodeSelector: { "kubernetes.io/hostname": node },
-      tolerations: [{ operator: "Exists" }],
-      containers: [
-        {
-          name: SHELL_CONTAINER,
-          image: HELPER_IMAGE,
-          imagePullPolicy: "IfNotPresent",
-          securityContext: { privileged: true },
-          // Nothing to do but stay alive: the terminal attaches with `kubectl exec`,
-          // which starts its own process inside this container.
-          command: ["/bin/sh", "-c", "while :; do sleep 300; done"],
-          volumeMounts: [{ name: "host", mountPath: "/host" }],
-        },
-      ],
-      volumes: [{ name: "host", hostPath: { path: "/" } }],
-    },
-  };
-}
-
-/**
- * Create the shell Pod if it is not there, then wait for it to be Running.
+ * Restart / Power off, WITHOUT A POD.
  *
- * A Pod that is Terminating, Failed or Succeeded has to be removed and recreated: its
- * container is gone, so it can never become a shell, and simply waiting would fail after
- * 40 s with a confusing message.
+ * These buttons used to create a one-shot privileged Pod that nsentered into PID 1 and ran
+ * `systemctl reboot` / `systemctl poweroff`. It worked, but every click left an object in
+ * the cluster - and a power off killed the node before anything could delete it, which is
+ * how three `kubeos-node-poweroff-*` Pods once sat in `kubeos-system` for 12 hours. The user
+ * drew the line on 2026-11-12: *"they too should not create pod.. and for future too"*.
+ *
+ * So the action is a POST to the node's console service (see console.py), which already runs
+ * as root on the host: `POST /action/restart` is the entire implementation. Nothing is
+ * created, so nothing can be left behind, and the answer comes back before systemd takes
+ * the machine down.
+ *
+ * The token is the same per-machine Secret the shell uses, and the reply has to arrive
+ * before the network goes away - both handled in console.py.
  */
-async function ensureShellPod(node: string): Promise<void> {
-  const path = `/api/v1/namespaces/${NAMESPACE}/pods/${SHELL_POD}`;
-  let existing: any = null;
+async function requestNodeAction(
+  action: PowerAction,
+  token: string,
+  port: number
+): Promise<void> {
+  const target = `https://${window.location.hostname}:${port}/action/${action}`;
+  let response: Response;
   try {
-    existing = await apiJson(path);
+    response = await fetch(target, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      // The console needs a moment to answer before the machine goes down; a long timeout
+      // would only hang the dialog.
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (reason: any) {
+    throw new Error(
+      `could not reach the node console on port ${port} - if this browser has never opened https://${
+        window.location.hostname
+      }:${port}/ , do that once and accept the certificate warning (${String(
+        reason?.message ?? reason
+      )}).`
+    );
+  }
+  if (response.status === 202) {
+    return;
+  }
+  let detail = "";
+  try {
+    detail = String((await response.json())?.error ?? "");
   } catch {
-    existing = null;
+    detail = response.statusText;
   }
-  const phase = existing?.status?.phase;
-  const unusable =
-    !existing ||
-    existing?.metadata?.deletionTimestamp ||
-    phase === "Succeeded" ||
-    phase === "Failed";
-
-  if (unusable) {
-    if (existing) {
-      // Wait for the old Pod to be gone, otherwise `create` answers 409.
-      await ApiProxy.remove(path).catch(() => {});
-      for (let attempt = 0; attempt < 30; attempt++) {
-        const still: any = await apiJson(path).catch(() => null);
-        if (!still) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-    try {
-      await ApiProxy.post(
-        `/api/v1/namespaces/${NAMESPACE}/pods`,
-        shellPod(node)
-      );
-    } catch (reason: any) {
-      // 409 is not a failure here: two quick clicks race, and the Pod the other click
-      // created is the Pod we want anyway.
-      if (!/409|already exists/i.test(String(reason?.message ?? reason))) {
-        throw reason;
-      }
-    }
-  }
-
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const pod: any = await apiJson(path);
-    const data = pod?.json ?? pod;
-    const status = data?.status?.phase;
-    if (status === "Running") {
-      return;
-    }
-    if (status === "Failed") {
-      throw new Error(
-        `the shell Pod failed: ${data?.status?.message ?? "see the Pod events"}`
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  throw new Error("the shell Pod did not reach Running within 40 s");
+  throw new Error(`${response.status} ${detail || response.statusText}`.trim());
 }
 
 /**
- * Closing the terminal must ALSO remove the Pod: it is privileged and mounts the host's
- * root filesystem, so leaving it behind would keep a root shell on the node alive for
- * nobody. The next click recreates it in about a second (the image is already on the
- * node), which is a fair price for not parking host root in the cluster.
+ * THE SHELL IS ON THE NODE, AND NOTHING IS CREATED IN THE CLUSTER TO GET IT.
+ *
+ * History, because the shape of this code only makes sense with it: the first version opened
+ * a shell by creating a privileged Pod and `kubectl exec`-ing into it, because the browser
+ * can only reach headlamp-server (a Kubernetes API proxy) and Kubernetes has no "run on the
+ * host" call. That worked, but the user rejected it (2026-11-12: *"yes i need shell without
+ * pod creation"*). So the node now runs `kubeos-console.service` - the PTY service in
+ * `deploy/binary/console.py` - and this file only opens a WebSocket to it and paints an
+ * xterm. A click creates no object, takes no privileged container and leaves nothing behind.
+ *
+ * WHY A TOKEN FROM A SECRET, and what it is worth: the console listens on its own port with
+ * the dashboard's certificate, so it needs *some* authentication of its own - the token
+ * stops a port scan or another web page from opening a root shell. It is fetched through the
+ * Kubernetes API rather than baked into the bundle, so it is per machine and never ships in
+ * the ISO. Anyone who can read that Secret can open the shell, but the dashboard's own
+ * kubeconfig is cluster-admin with no login, so that is the same set of people who can
+ * already do anything here. It is a lock on a door in a room, and it is honest about it.
+ *
+ * THE CERTIFICATE: the console shares the dashboard's self-signed certificate, but browsers
+ * scope trust per port and refuse a WebSocket to an untrusted one with no way to accept it.
+ * So the component catches a failed connection and tells the operator to open
+ * `https://<node>:30444/` once and accept the warning - the console serves a small page there
+ * for exactly that purpose.
+ */
+async function consoleConfig(): Promise<{ token: string; port: number }> {
+  let secret: any;
+  try {
+    secret = await apiJson<any>(
+      `/api/v1/namespaces/${NAMESPACE}/secrets/${CONSOLE_SECRET}`
+    );
+  } catch (reason: any) {
+    throw new Error(
+      `the host console is not installed on this node (Secret ${NAMESPACE}/${CONSOLE_SECRET} is missing): re-run install.sh. ${String(
+        reason?.message ?? reason
+      )}`
+    );
+  }
+  const data = secret?.data ?? {};
+  const decode = (value: any) => (value ? atob(String(value)) : "");
+  const token = decode(data.token);
+  if (!token) {
+    throw new Error(
+      `Secret ${NAMESPACE}/${CONSOLE_SECRET} has no token: re-run install.sh`
+    );
+  }
+  const port = Number(decode(data.port)) || CONSOLE_PORT;
+  return { token, port };
+}
+
+/**
+ * Closing the terminal stops the session; the console kills the shell when the socket goes
+ * away, so there is nothing to clean up in the cluster.
  */
 function closeShellActivity() {
   Activity.close(SHELL_ACTIVITY_ID);
-  ApiProxy.remove(`/api/v1/namespaces/${NAMESPACE}/pods/${SHELL_POD}`).catch(
-    () => {
-      // Already gone: closing the terminal twice is not an error.
-    }
-  );
 }
 
-/**
- * What the terminal activity renders. It re-reads the Pod through Headlamp's own object
- * store, so a Pod that was deleted while the terminal was open reports why instead of
- * showing a dead terminal.
- */
-function NodeShellContent({ onClose }: { onClose: () => void }) {
-  const [pod, error]: [any, any] = (PodClass as any).useGet(
-    SHELL_POD,
-    NAMESPACE
-  );
+/** xterm over the console's WebSocket. Everything visible here is the node's own shell. */
+function NodeConsole({
+  token,
+  port,
+  onClose,
+}: {
+  token: string;
+  port: number;
+  onClose: () => void;
+}) {
+  const host = React.useRef<HTMLDivElement | null>(null);
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const [hint, setHint] = React.useState<string | null>(null);
+  const hostname = window.location.hostname;
 
-  if (error) {
-    return (
-      <Box sx={{ p: 3 }}>
-        <Typography
-          variant="body2"
-          sx={{ color: "#E05050", wordBreak: "break-word" }}
-        >
-          The node shell Pod could not be read:{" "}
-          {String(error?.message ?? error)}
-        </Typography>
-      </Box>
-    );
-  }
-  if (!pod) {
-    return <CommonComponents.Loader title="Opening a shell on the node…" />;
-  }
-  // The one line a user needs and would otherwise have to guess: the terminal opens in
-  // the container, the node's own filesystem is at /host, and this is how to get a real
-  // host shell (same ritual Headlamp's own node shell expects).
+  React.useEffect(() => {
+    let socket: WebSocket | null = null;
+    let term: Terminal | null = null;
+    let fit: FitAddon | null = null;
+    let onWindowResize: (() => void) | null = null;
+    let disposed = false;
+
+    const stop = (text: string, extra?: string) => {
+      if (disposed) {
+        return;
+      }
+      setProblem(text);
+      if (extra) {
+        setHint(extra);
+      }
+      try {
+        socket?.close();
+      } catch {
+        // already closed
+      }
+      term?.dispose();
+      term = null;
+    };
+
+    if (!host.current) {
+      return undefined;
+    }
+    term = new Terminal({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily:
+        'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
+      theme: { background: "#0b0b0b", foreground: "#cfd8cf", cursor: "#c8f04a" },
+    });
+    fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host.current);
+    fit.fit();
+
+    const url = `wss://${hostname}:${port}/ws?token=${encodeURIComponent(token)}`;
+    socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
+
+    const sendSize = () => {
+      if (socket?.readyState === WebSocket.OPEN && term) {
+        socket.send(
+          JSON.stringify({ t: "r", cols: term.cols, rows: term.rows })
+        );
+      }
+    };
+
+    socket.onopen = () => {
+      sendSize();
+      fit?.fit();
+      sendSize();
+      term?.focus();
+      term?.onData((data: string) => {
+        if (socket?.readyState === WebSocket.OPEN) {
+          // Binary frames are stdin: the console writes them straight to the PTY.
+          socket.send(new TextEncoder().encode(data));
+        }
+      });
+      onWindowResize = () => {
+        fit?.fit();
+        sendSize();
+      };
+      window.addEventListener("resize", onWindowResize);
+    };
+    socket.onmessage = (event: MessageEvent) => {
+      if (typeof event.data === "string") {
+        term?.write(event.data);
+      } else {
+        term?.write(new Uint8Array(event.data as ArrayBuffer));
+      }
+    };
+    socket.onerror = () => {
+      stop(
+        `could not reach the host console on port ${port}`,
+        `If this browser has never opened https://${hostname}:${port}/ , do that once, accept the certificate warning, then press Shell again.`
+      );
+    };
+    socket.onclose = () => {
+      if (!disposed) {
+        stop("the host console closed this session");
+      }
+    };
+
+    return () => {
+      disposed = true;
+      if (onWindowResize) {
+        window.removeEventListener("resize", onWindowResize);
+      }
+      try {
+        socket?.close();
+      } catch {
+        // already closed
+      }
+      term?.dispose();
+      term = null;
+    };
+    // token/port come from the Secret and never change for an open activity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
-    <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <Box
-        sx={{
-          px: 2,
-          py: 1,
-          backgroundColor: BRAND.bg.panel,
-          borderBottom: `1px solid ${BRAND.bg.muted}`,
-        }}
-      >
-        <Typography variant="caption" sx={{ color: BRAND.text.body }}>
-          A privileged container on this node; the host filesystem is at{" "}
-          <code>/host</code>. For the node&apos;s own shell run{" "}
-          <Box component="code" sx={{ color: BRAND.lime.primary }}>
-            nsenter -t 1 -m -u -i -n -p -- /bin/bash
-          </Box>
-        </Typography>
-      </Box>
-      <Box sx={{ flex: 1, minHeight: 0 }}>
-        <Terminal noDialog open item={pod} onClose={onClose} />
-      </Box>
+    <Box
+      className="kubeos-node-shell"
+      sx={{ display: "flex", flexDirection: "column", height: "100%" }}
+    >
+      {problem ? (
+        <Box sx={{ p: 3 }}>
+          <Typography
+            variant="body2"
+            sx={{ color: "#E0A030", wordBreak: "break-word" }}
+          >
+            {problem}
+          </Typography>
+          {hint && (
+            <Typography
+              variant="caption"
+              sx={{ display: "block", mt: 1, color: BRAND.text.muted }}
+            >
+              {hint}
+            </Typography>
+          )}
+          <Button
+            variant="outlined"
+            size="small"
+            sx={{ mt: 2, color: BRAND.text.body, borderColor: BRAND.bg.muted }}
+            onClick={onClose}
+          >
+            Close
+          </Button>
+        </Box>
+      ) : (
+        <Box sx={{ flex: 1, minHeight: 0, pl: 1, pt: 1 }} ref={host} />
+      )}
     </Box>
   );
 }
@@ -427,10 +482,8 @@ function NodeActionDialog({
     setBusy(true);
     setError(null);
     try {
-      await ApiProxy.post(
-        `/api/v1/namespaces/${NAMESPACE}/pods`,
-        actionPod(action, node)
-      );
+      const { token, port } = await consoleConfig();
+      await requestNodeAction(action, token, port);
       onDone(
         isPowerOff
           ? `Power off requested for ${node}. The dashboard and every workload stop until it is powered on again.`
@@ -458,10 +511,9 @@ function NodeActionDialog({
           variant="caption"
           sx={{ display: "block", color: BRAND.text.muted, mb: 2 }}
         >
-          The request goes to the node&apos;s own systemd through a short-lived
-          privileged Pod, because a browser cannot reach the host any other way. The Pod is
-          never restarted (so this cannot loop) and it is removed automatically the next time
-          the dashboard loads.
+          The request goes straight to the node&apos;s own systemd through the KubeOS console
+          service on this node. Nothing is created in the cluster for it, so nothing can be
+          left behind.
         </Typography>
         {error && (
           <Typography
@@ -517,8 +569,9 @@ function NodeActions() {
       .then(setNode)
       .catch(() => setNode(""));
     // Housekeeping, not part of the button: clear the finished action Pods of earlier
-    // clicks (see sweepStaleActionPods).
-    sweepStaleActionPods().catch(() => {});
+    // clicks and any node-shell Pod orphaned by a session that was closed with its ✕
+    // (see sweepStaleActionPods and sweepLeftoverShellPod).
+    runHousekeeping();
   }, []);
 
   const openShell = async () => {
@@ -526,7 +579,10 @@ function NodeActions() {
     setMessage(null);
     try {
       const name = node || (await readNodeName());
-      await ensureShellPod(name);
+      // Housekeeping first: it also removes a shell Pod left by a dashboard deployed
+      // before 2026-11-12, which would otherwise sit there holding host root.
+      await runHousekeeping();
+      const { token, port } = await consoleConfig();
       Activity.launch({
         // A fixed id means a second click re-opens the same activity instead of stacking
         // identical terminals.
@@ -534,7 +590,13 @@ function NodeActions() {
         title: `Node shell: ${name}`,
         cluster: currentCluster(),
         location: "full",
-        content: <NodeShellContent onClose={closeShellActivity} />,
+        content: (
+          <NodeConsole
+            token={token}
+            port={port}
+            onClose={closeShellActivity}
+          />
+        ),
       });
       setShell("idle");
     } catch (reason: any) {

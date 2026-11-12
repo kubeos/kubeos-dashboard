@@ -1,0 +1,29 @@
+[Unit]
+Description=KubeOS host console (a shell on the node for the dashboard's Shell button)
+Documentation=https://github.com/skmdab/kubeos-dashboard
+# No Pod, no kubelet, no API call: this is the node's own terminal service. It shares the
+# dashboard's certificate, so the file must exist before it starts.
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/kubeos-dashboard/tls.crt
+ConditionPathExists=/etc/kubeos-dashboard/tls.key
+ConditionPathExists=/etc/kubeos-dashboard/console.token
+
+[Service]
+Type=simple
+# ROOT ON PURPOSE, and this is the whole point of the unit: the console IS the node's root
+# login, the same thing a Proxmox node console gives. The hardening the dashboard unit uses
+# (ProtectSystem, PrivateTmp, NoNewPrivileges, RestrictNamespaces) would make a shell
+# useless, so it is deliberately absent here instead of being present and ineffective -
+# the security boundary of this service is its token and the fact that it listens on one
+# port, not a sandbox around a shell that must reach everything.
+EnvironmentFile=/etc/default/kubeos-console
+ExecStart=/usr/bin/python3 /usr/lib/kubeos-console/console.py $CONSOLE_ARGS
+Restart=always
+RestartSec=2
+# Sessions are children of the service; stopping the unit must take them with it.
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

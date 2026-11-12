@@ -1388,3 +1388,210 @@ Consequence for me, written down so a later session does not drift: a dashboard-
 case here) now always ends with a `~/KubeOS` card refresh too — which is why the KubeOS tree carries more
 uncommitted notes than before. Those are notes, not ISO config; the ISO tree itself stays untouched until
 the user says otherwise.
+
+### Session 2026-11-12 (morning) — node actions: plain confirmation, no leftover Pods
+
+User, after testing the real power off: *"whenever i click poweroff button it poweroff the node and it is ok..
+but it is creating poweroff pod evrytime but why.. and also while poweroff it asking confirmation to enter
+node name.. but i want only just confirmation not to enter node name"*. Three fixes, all in
+`kubeos-branding/src/nodeactions.tsx` (+ rebuilt `dist/main.js`), deployed to the node and verified in a
+browser; pushed as `c936277` (`development` only, `main` still `30d8d26`).
+
+**1. Plain confirmation.** The typed node name is gone (it existed because "power off is irreversible";
+in practice it was friction on a single-node appliance — the dialog already states the consequence, and
+Power off stays the red button). `canSubmit` is now `!busy`; the `TextField` import went with it.
+
+**2. The leftover Pods — a real defect with a false explanation in the UI.** Every click creates a
+one-shot privileged Pod, because the *browser* can only reach headlamp-server, which proxies the
+Kubernetes API and exposes no way to run a command on the host. That part is unavoidable. What was wrong:
+the dialog claimed "the Pod is deleted when the node goes down". Measured on the node: **three**
+`kubeos-node-poweroff-*` Pods, all Failed/Unknown, the oldest 12 hours old. A power off kills the node
+before anything can delete its own Pod, the API server marks the object Unknown/Failed, and nothing in the
+cluster owns it. Fix: `sweepStaleActionPods()` runs when the top bar mounts — pods in `kubeos-system`
+labelled `kubeos.in/action=restart|poweroff` in a terminal phase (Succeeded/Failed/Unknown) are deleted,
+which happens exactly when the node comes back. Verified end to end: browser console printed
+`kubeos: removed 3 finished node-action pod(s)` and `kubectl get pods -A` went 3 → **0**.
+
+**3. The same Pods depended on an object they never use.** The dashboard's event list showed
+`MountVolume.SetUp failed for volume "kube-api-access-…": object "kubeos-system"/"kube-root-ca.crt" not
+registered` on those Pods — the default service-account mount pulls in a projected volume, and after a
+reboot the kubelet re-syncs those Pods and can fail on it. The action Pod runs one `nsenter` and never
+talks to the API, so `automountServiceAccountToken: false` removes the whole class; `POD_NAME` still comes
+from the downward API. Verified by running the identical spec with a harmless
+`nsenter … /bin/echo`: phase **Succeeded**, correct log, events `Scheduled|Pulled|Created` and **no
+FailedMount**.
+
+**Found but not fixed (pre-existing, unrelated to this change):** `npm run tsc` reports two type errors in
+`src/addnode.tsx` (337, 349) — `JoinBundle` requires `token` but the code sets only `{endpoint, caHash}`.
+`nodeactions.tsx` itself typechecks clean. Worth a small fix in the join page; it is a TypeScript-level
+mismatch only (the bundle builds fine).
+
+Screenshots: `~/.kubeos-vm/harness/poweroff-dialog-plain.png` (dialog: 0 inputs, red Power off enabled).
+
+### Session 2026-11-12 (later) — the Shell button is a NODE shell, and the container prompt is gone
+
+User, after the previous fix shipped: *"hey it not fixed still showing container shell.. not showing node shell and
+remove that promt container shell"*. Two separate things were wrong, and neither was the code that had just been
+written.
+
+**1. The plugin was right; the Pod was stale.** The deployed bundle already carried the launcher
+(`nsenter`-wrapping `/bin/bash`, sha256 `123e6079…`), yet the terminal still opened BusyBox. Cause: the launcher
+lives in the Pod's `command`, and `ensureShellPod()` reused *any* Running Pod — the one in the cluster had been
+created at 09:10 IST by the **previous** build, with `command: ["/bin/sh","-c","while :; do sleep 300; done"]` and
+no wrapper at all. Every click since then attached to that old container. Fix: `shellPod()` now stamps
+`kubeos.in/launcher: <fingerprint>` and `ensureShellPod()` replaces a Pod whose stamp is not the current one. The
+fingerprint is an **FNV-1a hash of the container name + the launcher script text**, not a hand-bumped constant, so
+it cannot go stale when either changes. Standing lesson: a Pod that outlives the plugin must carry the identity of
+the code that created it; "it is Running" is not "it is the right thing".
+
+**Why a wrapper at all:** Headlamp's `Terminal` execs a fixed list (`bash`, `/bin/bash`, `sh`, `/bin/sh`) chosen by
+the Pod's `kubernetes.io/os` nodeSelector, and its only props are `{item, isAttach, noDialog, onClose}` — there is
+no command override. The join-helper image is Alpine, so bash was absent and Headlamp fell through to `sh`, i.e. a
+shell in the container. The wrapper writes `/usr/local/bin/bash` (plus `/bin/bash` and `/usr/bin/bash` symlinks)
+that `nsenter -t 1 -m -u -i -n -p -- /bin/bash -l` into PID 1 and forwards `"$@"` so `bash -c …` still works.
+Proven live before trusting the UI: on a fresh Pod, `bash -c …` → `KubeOS Linux v1.0 (Orhan)`, `sh -c …` → `Alpine
+Linux`.
+
+**2. The "Container" dropdown had to go, and `noDialog` does not remove it.** `noDialog` skips the dialog that asks
+which shell to open, but the `Terminal` component still renders a container chooser over the terminal itself — a
+`MuiFormControl-root` whose label is `#container-name-chooser-label` and whose select is `#container-name-chooser`
+(found by dumping the DOM in puppeteer, not by guessing). There is exactly one container and the shell is the
+host's, so its only function was to mislead. It has no prop, so `NodeShellContent` now renders the terminal inside a
+`.kubeos-node-shell` Box with a scoped `<style>` that hides `.MuiFormControl-root:has(#container-name-chooser-label)`
+and both ids. The "A privileged container on this node … run nsenter yourself" banner was deleted in the same
+change (user: *"remove that promt container shell"*), and the container was renamed `shell` → `node` so even a
+browser without `:has()` shows `Container: node`.
+
+**Verified in a real browser** (`~/.kubeos-vm/harness/shell-node-check.js`, screenshot `shell-node-check.png`):
+no page errors, no banner text anywhere in the DOM, the picker row absent, and typing into the terminal returns
+`hostname` → `kubeos`, `/etc/os-release` → `PRETTY_NAME="KubeOS Linux v1.0 (Orhan)"`, `command -v kubectl` →
+`/usr/bin/kubectl`, `ls -d /host` → `no-/host` (i.e. not the container), prompt `root@kubeos:/#`. Pod label reads
+`kubeos.in/launcher: 1abe7da1`.
+
+**Build-script bug found on the way (fixed):** `build-binary.sh`'s `plugin_is_stale()` used git and flagged
+*uncommitted* `src/*.tsx` as "the release would ship an old plugin" — it warned on a release that had just been
+rebuilt from those very edits. It now compares mtimes against `dist/main.js` with a 2 s tolerance for checkout
+skew, which is what "was dist built after the last src edit" actually means.
+
+Releases: `06ea2f87…` (staleness fix), `fcc0fdbd…` (final, plugin `main.js` sha256 `15dfa243…`). Still
+**uncommitted** in `development`: `nodeactions.tsx`, `dist/main.js`, `build-binary.sh`, `MEMORY.md`.
+
+Screenshot: `~/.kubeos-vm/harness/shell-node-check.png`.
+
+**Follow-up in the same item — the leftover shell Pod.** A browser test closed without touching the terminal left
+`kubeos-node-shell` Running with host root mounted, and the one-hour `activeDeadlineSeconds` was the only thing that
+would ever clean it (closing the activity with its own ✕ does not call the terminal's `onClose`). Since the user
+already objected to leftover Pods for the power-off buttons, the shell got the same housekeeping:
+`sweepLeftoverShellPod()` deletes `kubeos-system/kubeos-node-shell` when the dashboard loads (a Pod that exists
+while no terminal is open cannot belong to a live session), and `runHousekeeping()` runs both sweeps once per page
+load and is **awaited by the Shell button** so a click in the same second cannot delete the Pod the click created.
+Verified: browser console printed `kubeos: removed a leftover node shell pod`, the terminal then opened on the
+host, release `194ea879…`, plugin `main.js` `a30ac58c…`.
+
+### Session 2026-11-12 (later still) — the Shell button now creates NO POD: a host console service
+
+User: *"yes i need shell without pod creation"*. The Pod existed because the browser can only reach headlamp-server
+(a Kubernetes API proxy) and Kubernetes has no "run on the host" call, so the only container route was the
+privileged-Pod-plus-nsenter trick. Removing it means the node has to run its own terminal service, and that is now
+`kubeos-console.service`:
+
+**`deploy/binary/console.py`** — python3, **standard library only** (no vendoring, no build step, works offline on a
+KubeOS image that already ships `python3-minimal`; `ttyd`/`gotty` were rejected as one more binary to ship and
+trust). It is a TLS WebSocket server: handshake by hand, frames parsed with masking and a buffer, `pty.fork()` +
+`/bin/bash -l` as root, resize via `TIOCSWINSZ`+`SIGWINCH` from `{"t":"r","cols":..,"rows":..}` text frames, stdin as
+binary frames, PTY output as binary frames. `GET /healthz` for readiness and `GET /` for a one-line page whose only
+job is to let a browser accept the certificate. Auth: per-machine token, `hmac.compare_digest`, plus a same-host
+`Origin` check.
+
+**The bug that cost an hour, worth remembering:** the first version had a reader thread and a writer thread on one
+`SSLSocket`. The shell ran (`id`'s output really was `uid=0(root)` - proved by writing it to a file from inside the
+session) but **not a byte of output reached the browser** while the *echoed input* did, so it looked like the PTY was
+dead. An `SSLSocket` is not safe for a concurrent read and write; the fix is one `select()` loop driving both the
+socket and the PTY, with frames parsed from a buffer because `recv` can return half a frame. Lesson: when output
+disappears but input is visibly echoed, suspect the transport, not the shell - and prove execution by dropping a file
+from inside the session.
+
+**A rejected design, recorded so nobody re-derives it:** proxying the console through the API server
+(`/api/v1/namespaces/kubeos-system/services/http:kubeos-console:30444/proxy/ws`) would keep everything same-origin on
+30443 and avoid the second certificate prompt entirely - but **Endpoints forbid loopback addresses**
+(`Invalid value: "127.0.0.1": may not be in the loopback range`), so the console would have to listen on the LAN
+anyway, and it would add a Service + Endpoints (and `services/proxy` RBAC) to every node's cluster view. Dropped.
+
+**Wiring:** the unit runs as **root on purpose** and says so - it IS the node's root login, so the dashboard unit's
+hardening (`ProtectSystem`, `PrivateNuma`… ) is deliberately absent instead of silently ineffective. `install.sh` grew
+`--console-port` (default 30444) and `--no-console`, installs `console.py` to `/usr/lib/kubeos-console/`, generates
+`/etc/kubeos-dashboard/console.token` (32 bytes hex, kept on re-run), writes `/etc/default/kubeos-console`, publishes
+the token as Secret `kubeos-system/kubeos-console-token`, and health-checks `https://127.0.0.1:30444/healthz`.
+`uninstall.sh` removes both units. The release tarball now carries `console/console.py` + `systemd/kubeos-console.service`.
+
+**Plugin:** `nodeactions.tsx` lost `shellPod`, `shellLauncherScript`, `ensureShellPod`, `SHELL_LAUNCHER_VERSION` and
+the Headlamp `Terminal`/container-dropdown workaround; it gained `consoleConfig()` (reads the token+port from the
+Secret through `apiJson`) and `NodeConsole` (xterm 5.5 + addon-fit, **bundled** - `@xterm/xterm` and
+`@xterm/addon-fit` are now declared dependencies at 5.5.0/0.10.0, and the CSS is inlined by vite:
+`grep -c xterm-viewport dist/main.js` → 2, no stray `dist/*.css`). Bundle 121 KB → 420 KB. On a failed handshake the
+activity explains the one-time `https://<node>:30444/` certificate acceptance instead of dying silently.
+`sweepLeftoverShellPod()` stays: it deletes a `kubeos-node-shell` Pod left by an older dashboard.
+
+**Verified on the node (192.168.122.5):** `kubeos-console` and `kubeos-dashboard` both `active`; browser test
+(`~/.kubeos-vm/harness/shell-node-check.js`) → no page errors, no container banner or picker in the DOM, terminal
+answers `kubeos`, `PRETTY_NAME="KubeOS Linux v1.0 (Orhan)"`, `/usr/bin/kubectl`, `no-/host`, prompt `root@kubeos:/#`;
+**`kubectl get pods -A` → No resources found** during and after the session, and `ps -ef | grep 'bash -l'` → 0 after
+the socket closed (the console hangs the shell up). Console journal: `opened a shell` / `closed a shell`. Release
+`8df28576…`. Still **uncommitted** on `development`.
+
+Screenshot: `~/.kubeos-vm/harness/shell-node-check.png`.
+
+### Session 2026-11-12 (final) — Restart and Power off create no Pod either, and that is now a standing rule
+
+User: *"ok now recheck again the buttons you have added earlier they too should not create pod.. and for future too"*.
+
+**Implementation.** `console.py` grew `POST /action/restart` and `POST /action/poweroff`: token via
+`Authorization: Bearer` (or `?token=`), same-host `Origin` check, CORS preflight handled (`do_OPTIONS`), reply **202
+first** and only then `subprocess.Popen([systemctl, *argv], start_new_session=True)` — because the answer has to reach
+the browser before the network goes away, and systemd must not take the shutdown down with the service it is
+stopping. `--systemctl <path>` exists so the endpoints can be proven against a stand-in without rebooting a node.
+The plugin lost `actionPod()` and `actionScript()` entirely: `requestNodeAction()` is one `fetch` with the token from
+the same Secret, and the dialog text no longer mentions a Pod. What is left Pod-shaped in `nodeactions.tsx` only
+**deletes** (`sweepStaleActionPods`, `sweepLeftoverShellPod`).
+
+**Two things testing caught.** (1) The first in-flight guard was a latch: after one accepted action the console
+refused every later action *for ever* (observed: `POST /action/poweroff → 409 already running: restart`), so a failed
+`systemctl` would wedge it until someone restarted the unit. Now it is `(verb, monotonic time)` with a 120 s window —
+enough to stop a double click, and a reboot clears it anyway. (2) `command -v`-style shell tests: the stand-in
+`systemctl` written through an **unquoted heredoc** logged an empty verb, because `$*` and `$(date -Is)` were expanded
+when the file was *written*, not when it ran — use `<<"SH"`. Both were found by running, not reading.
+
+**Verification, in order.** Stand-in console on 30445 + Secret `port=30445` (the plugin reads the port from the
+Secret, so this is a real end-to-end dry run): browser click Restart → `204 OPTIONS`, `POST /action/restart` **202**,
+dialog closed, header message *"Restart requested for kubeos"*, and the stand-in recorded `reboot`; direct API call
+for `poweroff` recorded `poweroff`; a second call inside the window → 409; a call with no token → 403; **`kubectl get
+pods -A` empty throughout**. Then the Secret was reset to the default port, the stand-ins removed, and a **real**
+`POST /action/restart` on :30444 fired: the node went down and came back in ~15 s, `kubeos-console` and
+`kubeos-dashboard` both `active`, node `Ready`, `kubectl get pods -A` → *No resources found*, dashboard 200, console
+200, and the post-reboot browser shell test still lands in `root@kubeos:/#`. Release `b31bcc77…`.
+
+**The rule is written down in both repos**, not just honoured once: `~/kubeos-dashboard/AGENTS.md` §0.1 and
+`~/KubeOS/AGENTS.md` §8 — *no dashboard button may create, patch or delete a Pod to do the node's work; all host work
+goes through `kubeos-console.service`; if a feature seems to need a Pod it needs a node service instead.*
+Screenshot: `~/.kubeos-vm/harness/action-ui.png`.
+
+### Session 2026-11-12 — brand: the MFZ mark is now the KUBEOS lime
+
+User: *"now the logo MFZ logo color with KUBEOS color.. please make MFZ color same as KUBEOS which have now"*.
+
+Measured first, then changed: the app-bar logo is two images (`src/assets/mark.png` = the **MFZ** monogram, 128x76;
+`src/assets/wordmark.png` = **KUBEOS**, 343x65), embedded as base64 in the generated `src/assets.ts`. Their opaque
+pixels averaged **#49dc14** (MFZ, the darker green) against **#c4ff2e** (KUBEOS). The wordmark is effectively flat -
+eight column bands measured `#bcff2c` to `#c8ff32`, so there is no gradient to copy, only a glow in the alpha.
+
+Change: `mark.png` recoloured to **#c4ff2e** with every alpha value **untouched**, so the anti-aliased edges are
+byte-for-byte the same shape (3,810 visible pixels rewritten). `favicon.png` is the same MFZ monogram (64x64) and was
+in the old green, so it got the same treatment - one logo, not two colours in one browser tab. `npm run assets`
+regenerated `assets.ts` (64 KB -> 52 KB; flat colour compresses better). Release `795a4d10…`, plugin `main.js`
+`fbc66ed1…`, verified in a real browser: the header clip reads MFZ and KUBEOS in the same lime, and the favicon
+`<link>` still resolves to an inlined data URI.
+
+Not touched, deliberately: the ISO artwork (`config/bootloaders/{grub-pc,isolinux}/splash.png`,
+`config/includes.binary/isolinux/splash.png`, the plymouth `splash.png`) also carries the MFZ wordmark in the old
+colour. That is a different surface with a rebuild attached - ask before changing it.
+Screenshot: `~/.kubeos-vm/harness/logo-after.png` (before/after: `logo-before-after.png`).

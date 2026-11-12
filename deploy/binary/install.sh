@@ -47,6 +47,16 @@ DO_START=1
 # addresses identical to the container deployment's (/c/main/...), so bookmarks and the
 # links the KubeOS console prints stay valid.
 CONTEXT_NAME=main
+
+# The host console (the dashboard's Shell button). Separate unit, separate port, no Pod.
+CONSOLE_SERVICE=kubeos-console
+CONSOLE_DIR=/usr/lib/kubeos-console
+CONSOLE_ENV=/etc/default/$CONSOLE_SERVICE
+CONSOLE_UNIT=/etc/systemd/system/$CONSOLE_SERVICE.service
+CONSOLE_TOKEN=$CONF_DIR/console.token
+CONSOLE_SECRET=kubeos-console-token
+CONSOLE_PORT=30444
+DO_CONSOLE=1
 SRC=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
@@ -62,6 +72,11 @@ Usage: $0 --kubeconfig <path> [options]
                         'IP:192.168.1.50' or 'DNS:dashboard.lan' (repeatable)
   --context-name <name> name for the kubeconfig context in the installed copy, which
                         decides the cluster id in every URL (default $CONTEXT_NAME)
+  --console-port <n>    HTTPS port of the host console, i.e. what the Shell button
+                        connects to (default $CONSOLE_PORT). It shares the dashboard's
+                        certificate, so a browser has to accept :30444 once.
+  --no-console          do not install the host console; the Shell button then reports
+                        that the console is not installed
   --no-start            install and enable, but do not start the service now
   -h, --help            this text
 USAGE
@@ -76,6 +91,8 @@ while [ $# -gt 0 ]; do
         --tls-key) TLS_KEY=$2; shift 2 ;;
         --san) EXTRA_SANS="$EXTRA_SANS $2"; shift 2 ;;
         --context-name) CONTEXT_NAME=$2; shift 2 ;;
+        --console-port) CONSOLE_PORT=$2; shift 2 ;;
+        --no-console) DO_CONSOLE=0; shift ;;
         --no-start) DO_START=0; shift ;;
         -h | --help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
@@ -171,6 +188,83 @@ else
     log "generated a self-signed certificate for $sans (valid $CERT_DAYS days)"
 fi
 
+# ---- host console --------------------------------------------------------
+# WHY A SEPARATE SERVICE: the Shell button used to create a privileged Pod and exec into it,
+# because Kubernetes has no "run on the host" call (user: *"i need shell without pod
+# creation"*, 2026-11-12). This service is the node's own PTY over TLS WebSocket, so a click
+# creates nothing in the cluster. It shares the dashboard's certificate and is reachable at
+# https://<node>:$CONSOLE_PORT/ - open that page once per browser to accept the certificate,
+# because a page may accept a certificate warning but a WebSocket may not.
+if [ "$DO_CONSOLE" -eq 1 ]; then
+    [ -s "$SRC/console/console.py" ] ||
+        die "incomplete release: $SRC/console/console.py is missing (or use --no-console)"
+    install -d -m 0755 "$CONSOLE_DIR"
+    install -m 0644 "$SRC/console/console.py" "$CONSOLE_DIR/console.py"
+    chown root:root "$CONSOLE_DIR/console.py"
+
+    # One token per machine, kept if it already exists so a re-run does not break a browser
+    # tab that is already connected... it does not survive a reload, but rotating a secret
+    # on every install would be a surprise with no benefit.
+    if [ ! -s "$CONSOLE_TOKEN" ]; then
+        (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$CONSOLE_TOKEN")
+        chmod 0600 "$CONSOLE_TOKEN"
+        log "generated the console token in $CONSOLE_TOKEN"
+    fi
+
+    {
+        printf '# Written by kubeos-dashboard install.sh - re-run it to change the flags.\n'
+        printf 'CONSOLE_ARGS=--listen 0.0.0.0 --port %s --tls-cert %s/tls.crt --tls-key %s/tls.key --token-file %s\n' \
+            "$CONSOLE_PORT" "$CONF_DIR" "$CONF_DIR" "$CONSOLE_TOKEN"
+    } > "$CONSOLE_ENV"
+    chmod 0644 "$CONSOLE_ENV"
+
+    install -m 0644 "$SRC/systemd/$CONSOLE_SERVICE.service" "$CONSOLE_UNIT"
+
+    # The browser gets the token from the cluster, not from the page: the dashboard reads this
+    # Secret through the API it already proxies. Honest limit: anyone who can read that
+    # Secret could open the shell - but the dashboard's own kubeconfig is cluster-admin, so
+    # that is the same set of people who can already do anything on this node.
+    if command -v kubectl >/dev/null 2>&1; then
+        kubectl --kubeconfig "$CONF_DIR/kubeconfig" get namespace kubeos-system >/dev/null 2>&1 ||
+            kubectl --kubeconfig "$CONF_DIR/kubeconfig" create namespace kubeos-system >/dev/null 2>&1 ||
+            log "WARNING: could not create the kubeos-system namespace"
+        kubectl --kubeconfig "$CONF_DIR/kubeconfig" -n kubeos-system create secret generic \
+            "$CONSOLE_SECRET" --from-literal=token="$(cat "$CONSOLE_TOKEN")" \
+            --dry-run=client -o yaml 2>/dev/null |
+            kubectl --kubeconfig "$CONF_DIR/kubeconfig" apply -f - >/dev/null 2>&1 &&
+            log "published the console token as Secret kubeos-system/$CONSOLE_SECRET" ||
+            log "WARNING: could not publish Secret kubeos-system/$CONSOLE_SECRET (the Shell button will say so)"
+    else
+        log "WARNING: kubectl not found, so the console token was not published to the cluster"
+    fi
+
+    systemctl daemon-reload
+    systemctl enable "$CONSOLE_SERVICE" >/dev/null 2>&1
+    log "enabled $CONSOLE_SERVICE"
+
+    if [ "$DO_START" -eq 1 ]; then
+        systemctl restart "$CONSOLE_SERVICE"
+        console_url="https://127.0.0.1:$CONSOLE_PORT/healthz"
+        console_code=""
+        i=1
+        while [ "$i" -le 20 ]; do
+            if command -v curl >/dev/null 2>&1; then
+                console_code=$(curl -sk -o /dev/null -w '%{http_code}' "$console_url" 2>/dev/null || true)
+            elif command -v wget >/dev/null 2>&1; then
+                console_code=$(wget --no-check-certificate -q -O /dev/null "$console_url" 2>/dev/null && echo 200 || true)
+            fi
+            [ "$console_code" = "200" ] && break
+            sleep 1
+            i=$((i + 1))
+        done
+        if [ "$console_code" = "200" ]; then
+            log "host console answers on $console_url (HTTP 200)"
+        else
+            log "WARNING: the host console did not answer - check: journalctl -u $CONSOLE_SERVICE -n 40 --no-pager"
+        fi
+    fi
+fi
+
 # ---- flags + unit --------------------------------------------------------
 ARGS="--kubeconfig=$CONF_DIR/kubeconfig"
 ARGS="$ARGS --html-static-dir=$SHARE_DIR/frontend"
@@ -228,4 +322,10 @@ log "  logs      journalctl -u $SERVICE -f"
 log "  identity  $CONF_DIR/kubeconfig (all users share it - the dashboard has no login of its own)"
 if [ -n "${code:-}" ] && [ "$code" = "200" ]; then
     log "  the certificate is self-signed: the browser will warn once; accept it for this host"
+fi
+if [ "$DO_CONSOLE" -eq 1 ]; then
+    log ""
+    log "Host console: https://${show_host:-<node-ip>}:$CONSOLE_PORT/  <- open once per browser"
+    log "  it is what the dashboard's "Shell" button connects to (no Pod is created)"
+    log "  service   systemctl status $CONSOLE_SERVICE"
 fi

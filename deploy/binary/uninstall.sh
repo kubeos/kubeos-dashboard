@@ -11,6 +11,8 @@ log() { printf 'uninstall-dashboard: %s\n' "$*"; }
 die() { printf 'uninstall-dashboard: ERROR: %s\n' "$*" >&2; exit 1; }
 
 SERVICE=kubeos-dashboard
+# The host console (the Shell button) is its own unit with its own token and port.
+CONSOLE_SERVICE=kubeos-console
 RUN_USER=kubeos-dashboard
 PURGE=0
 
@@ -24,19 +26,21 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 
-if systemctl list-unit-files 2>/dev/null | grep -q "^$SERVICE.service"; then
-    systemctl stop "$SERVICE" 2>/dev/null || true
-    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
-fi
-
-rm -f "/etc/systemd/system/$SERVICE.service" "/etc/default/$SERVICE"
+for unit in "$CONSOLE_SERVICE" "$SERVICE"; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^$unit.service"; then
+        systemctl stop "$unit" 2>/dev/null || true
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+    fi
+    rm -f "/etc/systemd/system/$unit.service" "/etc/default/$unit"
+done
 systemctl daemon-reload
 log "service removed"
 
 # Config and secrets go; the state directory only on --purge, because a future install
 # would otherwise lose Headlamp's own preferences for the node.
-rm -rf /usr/lib/kubeos-dashboard /usr/share/kubeos-dashboard /etc/kubeos-dashboard
-log "binary, frontend, plugin, kubeconfig and certificate removed"
+rm -rf /usr/lib/kubeos-dashboard /usr/share/kubeos-dashboard /usr/lib/kubeos-console \
+    /etc/kubeos-dashboard
+log "binary, frontend, plugin, console, kubeconfig, token and certificate removed"
 
 if [ "$PURGE" -eq 1 ]; then
     rm -rf /var/lib/kubeos-dashboard

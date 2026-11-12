@@ -26,6 +26,23 @@ that a session which dies at any second leaves a memory file that is already tru
   first thing to try when a session is interrupted.
 - A *new* session needs only the paste line at the top of `~/KubeOS/RESUME.md`.
 
+## 0.1 HARD RULE: no button may create a Pod (user decision 2026-11-12)
+
+*"they too should not create pod.. and for future too"* — the user said this after the Shell button was moved off
+Pods, about **Restart and Power off**. It is a standing rule, not a one-off cleanup:
+
+- **Nothing in this dashboard may create, patch or delete a Pod to do the node's work.** No privileged one-shot
+  Pods, no Jobs, no exec, no `nsenter` container. A click must not leave an object in the cluster, and a power off
+  must not be able to strand one (three `kubeos-node-poweroff-*` Pods once sat in `kubeos-system` for 12 hours
+  because the node died before anything could delete them).
+- **All host work goes through `kubeos-console.service`** (`deploy/binary/console.py`, root on the node):
+  `POST /action/restart`, `POST /action/poweroff`, and the shell's WebSocket. Same per-machine token (Secret
+  `kubeos-system/kubeos-console-token`, published by `install.sh`), same certificate, port 30444.
+- **If a new feature seems to need a Pod**, it needs a service on the node instead — or it waits for the user to
+  decide. Do not re-derive the Pod design because it is the easy path.
+- The only Pod-related code left is `sweepStaleActionPods()` / `sweepLeftoverShellPod()`, which **delete** debris
+  left by dashboards deployed before 2026-11-12. They never create anything.
+
 ## 1. Project overview
 
 - **kubeos-dashboard** is the web dashboard for **KubeOS**, built on top of **Headlamp** (the Headlamp repo is cloned on the host).

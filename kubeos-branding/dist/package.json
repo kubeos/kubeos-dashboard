@@ -28,5 +28,9 @@
     "extraDist": {
       "package.json": "package.json"
     }
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/xterm": "5.5.0"
   }
 }
