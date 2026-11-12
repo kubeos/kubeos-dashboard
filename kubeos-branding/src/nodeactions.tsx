@@ -88,9 +88,24 @@ async function apiJson<T>(path: string): Promise<T> {
 }
 
 /** The node this dashboard manages. Single-node appliance: there is exactly one. */
-async function readNodeName(): Promise<string> {
-  const list = await apiJson<{ items: any[] }>("/api/v1/nodes");
-  return list?.items?.[0]?.metadata?.name ?? "";
+/**
+ * The node SERVING this dashboard, i.e. the machine these buttons actually act on.
+ *
+ * WHY IT IS NOT THE CLUSTER'S FIRST NODE: it used to be `GET /api/v1/nodes` -> items[0].name,
+ * which is simply "some node", usually the control plane. On kubeos2's dashboard that made the
+ * Shell window say "Node shell: kubeos1" and the restart dialog say "Restart requested for
+ * kubeos1" while it restarted kubeos2 (user caught it, 2026-11-12). The gateway on this host
+ * answers `/kubeos-node`, so the answer is always the machine you are talking to.
+ */
+async function readServingNode(): Promise<string> {
+  try {
+    const answer = await fetch("/kubeos-node", { headers: { Accept: "application/json" } });
+    if (!answer.ok) return "";
+    const body = await answer.json();
+    return String(body?.node ?? "");
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -509,7 +524,7 @@ function NodeActions() {
   const [message, setMessage] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    readNodeName()
+    readServingNode()
       .then(setNode)
       .catch(() => setNode(""));
     // Housekeeping, not part of the button: clear the finished action Pods of earlier
@@ -522,7 +537,6 @@ function NodeActions() {
     setShell("busy");
     setMessage(null);
     try {
-      const name = node || (await readNodeName());
       // Housekeeping first: it also removes a shell Pod left by a dashboard deployed
       // before 2026-11-12, which would otherwise sit there holding host root.
       await runHousekeeping();
@@ -531,7 +545,7 @@ function NodeActions() {
         // A fixed id means a second click re-opens the same activity instead of stacking
         // identical terminals.
         id: SHELL_ACTIVITY_ID,
-        title: `Node shell: ${name}`,
+        title: "Node shell",
         cluster: currentCluster(),
         location: "full",
         content: (

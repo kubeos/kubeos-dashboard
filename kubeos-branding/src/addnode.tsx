@@ -540,7 +540,7 @@ function JoinNodePage() {
 registerSidebarEntry({
   parent: null,
   name: 'kubeos-add-node',
-  label: 'Join node',
+  label: 'Join Cluster',
   url: '/kubeos-add-node',
   icon: 'mdi:server-plus',
 });
