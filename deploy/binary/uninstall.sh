@@ -13,6 +13,8 @@ die() { printf 'uninstall-dashboard: ERROR: %s\n' "$*" >&2; exit 1; }
 SERVICE=kubeos-dashboard
 # The host console (the Shell button) is its own unit with its own token and port.
 CONSOLE_SERVICE=kubeos-console
+# The login gateway in front of the dashboard (own unit, own env file).
+AUTH_SERVICE=kubeos-dashboard-auth
 RUN_USER=kubeos-dashboard
 PURGE=0
 
@@ -26,7 +28,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 
-for unit in "$CONSOLE_SERVICE" "$SERVICE"; do
+for unit in $AUTH_SERVICE "$CONSOLE_SERVICE" "$SERVICE"; do
     if systemctl list-unit-files 2>/dev/null | grep -q "^$unit.service"; then
         systemctl stop "$unit" 2>/dev/null || true
         systemctl disable "$unit" >/dev/null 2>&1 || true

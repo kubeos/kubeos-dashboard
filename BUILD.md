@@ -172,10 +172,37 @@ half-installed service is not a state you can end up in.
 | `--context-name <name>` | `main` | cluster id in every URL (`/c/<name>/…`) |
 | `--console-port <n>` | `30444` | HTTPS port of the host console (what the Shell button connects to) |
 | `--no-console` | — | do not install the host console; the Shell button then reports it is missing |
+| `--no-login` | — | no login gateway: the dashboard then accepts any request that reaches its port (it is cluster-admin, so this is a real exposure) |
+| `--session-hours <n>` | `12` | how long a login stays valid |
+| `--self-signed` | — | do not use the cluster CA; make a per-node self-signed certificate (the browser then warns once per node, for ever) |
+| `--ca-cert` / `--ca-key` | cluster CA | use a CA you own; both files are installed so the node can sign its own leaf |
 | `--no-start` | — | install and enable, but do not start now |
 
-Re-running `install.sh` is the **upgrade path**: it replaces the binary, frontend and plugin, keeps
-the existing certificate and kubeconfig, rewrites the flags and restarts the unit.
+Re-running `install.sh` is the **upgrade path**: it replaces the binary, frontend and plugin, re-signs the
+node certificate, rewrites the flags and restarts the units.
+
+### Login and certificates (why the port is not open)
+
+Headlamp has no local login: it authenticates with the kubeconfig it was given. On its own that means
+**anyone who reaches the port is cluster-admin without a password**. So `install.sh` installs a small
+gateway in front of it (`authproxy.py` + `kubeos-dashboard-auth.service`, python3 standard library):
+the gateway owns the public port, Headlamp moves to `127.0.0.1:30445`, and you sign in with a local
+account — `root`, or any member of `sudo` — using the password you set when you installed the machine.
+Five failed attempts per address in five minutes are refused, and the session is an HMAC-signed cookie
+(`kubeos_session`, `--session-hours`, cleared by `/kubeos-logout`). Everything else, including WebSocket
+exec/logs, is proxied through unchanged.
+
+Certificates: the first node creates **one CA for the cluster** (Secret `kubeos-system/kubeos-dashboard-ca`,
+first writer wins — later nodes adopt it) and signs its own leaf with **every node's InternalIP** as a SAN;
+so one browser import covers every node and both ports. The CA is downloadable **without a login** from
+`https://<node>:30443/kubeos-ca.crt`:
+
+```sh
+# Chrome / Brave / Edge, per user (no root needed)
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "KubeOS Cluster CA" -i kubeos-ca.crt
+# then restart the browser - it reads that store only at startup
+```
+re-run `install.sh` on the other nodes after adding a node, so the new IP enters everyone's SAN list.
 
 ### What it creates
 
@@ -183,7 +210,10 @@ the existing certificate and kubeconfig, rewrites the flags and restarts the uni
 /usr/lib/kubeos-dashboard/headlamp-server      binary + VERSION            root:root 0755
 /usr/share/kubeos-dashboard/{frontend,plugins} the UI and the plugin       root:root 0755
 /etc/kubeos-dashboard/kubeconfig               the shared identity          0600
-/etc/kubeos-dashboard/tls.crt, tls.key         HTTPS                        0644 / 0600
+/etc/kubeos-dashboard/tls.crt, tls.key         HTTPS (leaf + CA chain)      0644 / 0600
+/etc/kubeos-dashboard/ca.crt, ca.key           the cluster CA               0644 / 0600
+/etc/kubeos-dashboard/session.key              login-cookie signing key     0600
+/usr/lib/kubeos-dashboard/authproxy.py         the login gateway            0755
 /etc/default/kubeos-dashboard                  the flags (HEADLAMP_ARGS=…)  0644
 /etc/systemd/system/kubeos-dashboard.service   the unit
 /var/lib/kubeos-dashboard/                     writable HOME for the server 0750

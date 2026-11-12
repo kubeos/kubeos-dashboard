@@ -19,6 +19,20 @@ must not create Pods either (*"they too should not create pod.. and for future t
 this service already runs as root on the host, `POST /action/<verb>` is the whole
 implementation - no object, nothing to schedule, nothing to leak.
 
+IT ALSO JOINS THIS NODE TO A CLUSTER (the dashboard's "Join node" page): `POST /action/join`
+hands the join string to `kubeos-node-join`, which disables this machine's control-plane
+units, discards its one-node cluster and runs `kubeadm join` - as a **transient systemd
+unit**, not a Pod (user rule 2026-11-12: no button may create a Pod). Running it under
+systemd is also what keeps it alive while the local API server it was talking to is being
+deleted.
+
+IT ALSO BROWSES AND FILLS NFS EXPORTS (the NFS page in the dashboard): a static NFS
+PersistentVolume is just a server and a path - nothing can list it without a mount, and
+the dashboard may not create a Pod to hold the mount. So `GET /nfs` mounts the export on
+the node (under /run/kubeos-nfs/<hash>, one mount per server:path, reused) and lists a
+directory, and `POST /nfs` writes an uploaded file into it. The mount lives on the node,
+so the contents listed are exactly what a Pod claiming that volume sees.
+
 WHAT IT DOES NOT DO: it does not authenticate a *user* - there are no users on this model.
 It requires a per-machine token (see --token-file) so a port scanner or a random web page
 cannot open a root shell, and it refuses a cross-origin handshake. Anyone who can read the
@@ -40,6 +54,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import socket
 import ssl
@@ -47,7 +62,9 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -241,6 +258,142 @@ class Session:
             self.pid = -1
 
 
+# ---- NFS exports ---------------------------------------------------------
+# WHY A MOUNT AND NOT AN API: an NFS PersistentVolume carries only a server and a path.
+# Nothing in Kubernetes can list a directory on it without a container holding the mount,
+# and the dashboard may not create containers. The node has mount.nfs, so the node mounts.
+
+NFS_ROOT = "/run/kubeos-nfs"
+NFS_DEFAULT_OPTIONS = "nfsvers=4.1,hard,timeo=600,retrans=2"
+NFS_MAX_UPLOAD = 256 * 1024 * 1024
+# Resolve the helper instead of hard-coding /sbin/mount: on Debian 13 /sbin is a symlink
+# to usr/sbin and `mount` lives in /usr/bin, so the "obvious" path does not exist (found by
+# the first request: FileNotFoundError surfaced as a 500 with no explanation).
+NFS_MOUNT_CMD = shutil.which("mount") or "/usr/bin/mount"
+# Anything that reaches a mount call is validated character by character: a space here
+# would be an argument, and a colon would be a different server.
+NFS_SERVER_RE = re.compile(r"^[A-Za-z0-9._:\[\]-]+$")
+NFS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/ :-]*$")
+NFS_OPTIONS_RE = re.compile(r"^[A-Za-z0-9._=:@/-]+(,[A-Za-z0-9._=:@/-]+)*$")
+# One lock, because two simultaneous browses of the same export must not race on mount.
+NFS_LOCK = threading.Lock()
+
+
+class Failure(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _is_mountpoint(path: str) -> bool:
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) > 4 and fields[4] == path:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def nfs_mountpoint(server: str, export: str, options: str = "") -> str:
+    """Mount the export if it is not mounted yet, and return the local directory."""
+    if not NFS_SERVER_RE.match(server or ""):
+        raise Failure(400, "invalid NFS server")
+    if not NFS_PATH_RE.match(export or "") or ".." in (export or ""):
+        raise Failure(400, "invalid NFS export path")
+    opts = (options or NFS_DEFAULT_OPTIONS).strip() or NFS_DEFAULT_OPTIONS
+    if not NFS_OPTIONS_RE.match(opts):
+        raise Failure(400, "invalid mount options")
+    key = hashlib.sha256(f"{server}:{export}".encode()).hexdigest()[:16]
+    point = os.path.join(NFS_ROOT, key)
+    with NFS_LOCK:
+        os.makedirs(point, mode=0o700, exist_ok=True)
+        if _is_mountpoint(point):
+            return point
+        result = subprocess.run(
+            [NFS_MOUNT_CMD, "-t", "nfs", "-o", opts, f"{server}:{export}", point],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            reason = (result.stderr or result.stdout or "").strip()
+            # A stale mountpoint from a mount that never completed blocks the retry.
+            raise Failure(502, f"could not mount {server}:{export} - {reason or 'mount failed'}")
+        log(f"mounted {server}:{export} on {point}")
+        return point
+
+
+def nfs_safe_path(root: str, sub: str) -> str:
+    """Resolve `sub` inside `root`, refusing anything that escapes it (realpath, so a
+    symlink pointing outside the export is refused too)."""
+    target = os.path.realpath(os.path.join(root, (sub or "").lstrip("/")))
+    if target != root and not target.startswith(root + os.sep):
+        raise Failure(403, "that path is outside the volume")
+    return target
+
+
+def nfs_listing(server: str, export: str, sub: str, options: str) -> dict:
+    root = nfs_mountpoint(server, export, options)
+    target = nfs_safe_path(root, sub)
+    if not os.path.isdir(target):
+        raise Failure(404, "not a directory")
+    entries = []
+    with os.scandir(target) as iterator:
+        for entry in iterator:
+            try:
+                info = entry.stat(follow_symlinks=False)
+                is_dir = entry.is_dir(follow_symlinks=False)
+                link = entry.is_symlink()
+            except OSError as reason:
+                entries.append({"name": entry.name, "dir": False, "size": 0,
+                                "mtime": 0, "error": str(reason)})
+                continue
+            entries.append({
+                "name": entry.name,
+                "dir": is_dir,
+                "link": link,
+                "size": info.st_size,
+                "mtime": int(info.st_mtime),
+                "mode": oct(info.st_mode & 0o777),
+            })
+    entries.sort(key=lambda item: (not item["dir"], item["name"].lower()))
+    relative = os.path.relpath(target, root)
+    return {
+        "server": server,
+        "export": export,
+        "path": "" if relative == "." else relative,
+        "parent": "" if relative in (".", "") else os.path.dirname(relative),
+        "entries": entries,
+    }
+
+
+def nfs_write(server: str, export: str, sub: str, name: str, body: bytes,
+              overwrite: bool, options: str) -> dict:
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise Failure(400, "invalid file name")
+    root = nfs_mountpoint(server, export, options)
+    directory = nfs_safe_path(root, sub)
+    if not os.path.isdir(directory):
+        raise Failure(404, "that directory is not on the volume")
+    target = os.path.join(directory, name)
+    if not os.path.realpath(target).startswith(root + os.sep):
+        raise Failure(403, "that path is outside the volume")
+    if os.path.exists(target) and not overwrite:
+        raise Failure(409, "a file with that name already exists")
+    # Write beside the target and rename: an interrupted upload leaves no half file, and
+    # an interrupted overwrite leaves the old contents intact.
+    temp = os.path.join(directory, f".kubeos-upload-{os.getpid()}-{int(time.time())}")
+    with open(temp, "wb") as handle:
+        handle.write(body)
+    os.chmod(temp, 0o644)
+    os.replace(temp, target)
+    return {"ok": True, "name": name, "size": len(body)}
+
+
 # ---- HTTP/WebSocket entry point ------------------------------------------
 
 
@@ -305,14 +458,78 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802 - CORS preflight
         self.send_response(204)
         self._cors()
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "POST, PUT, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _nfs_get(self, parsed) -> None:
+        query = parse_qs(parsed.query)
+        one = lambda key, default="": (query.get(key) or [default])[0]
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        try:
+            listing = nfs_listing(one("server"), one("export"), one("sub"), one("options"))
+            self._json(200, {"ok": True, **listing})
+        except Failure as reason:
+            self._json(reason.code, {"ok": False, "error": reason.message})
+        except OSError as reason:
+            self._json(500, {"ok": False, "error": str(reason)})
+        except Exception:  # noqa: BLE001 - never leave the browser with an empty reply
+            log("nfs list failed:\n" + traceback.format_exc())
+            self._json(500, {"ok": False, "error": "internal error (see journalctl -u kubeos-console)"})
+
+    def _nfs_post(self, parsed) -> None:
+        query = parse_qs(parsed.query)
+        one = lambda key, default="": (query.get(key) or [default])[0]
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._json(400, {"ok": False, "error": "empty upload"})
+            return
+        if length > NFS_MAX_UPLOAD:
+            self._json(413, {"ok": False, "error": "file larger than 256 MiB"})
+            return
+        body = b""
+        while len(body) < length:
+            chunk = self.rfile.read(min(1 << 20, length - len(body)))
+            if not chunk:
+                break
+            body += chunk
+        try:
+            result = nfs_write(
+                one("server"), one("export"), one("sub"), one("name"), body,
+                one("overwrite") in ("1", "true", "yes"), one("options"),
+            )
+            log(f"{self.client_address[0]} wrote {result['name']} ({result['size']} bytes)")
+            self._json(201, result)
+        except Failure as reason:
+            self._json(reason.code, {"ok": False, "error": reason.message})
+        except OSError as reason:
+            self._json(500, {"ok": False, "error": str(reason)})
+        except Exception:  # noqa: BLE001
+            log("nfs write failed:\n" + traceback.format_exc())
+            self._json(500, {"ok": False, "error": "internal error (see journalctl -u kubeos-console)"})
+
+    def do_PUT(self) -> None:  # noqa: N802 - uploads use PUT
+        parsed = urlparse(self.path)
+        if parsed.path != "/nfs":
+            self.send_error(404)
+            return
+        self._nfs_post(parsed)
+
     def do_POST(self) -> None:  # noqa: N802 - http.server naming
         path = urlparse(self.path).path
+        if path == "/nfs":
+            self._nfs_post(urlparse(self.path))
+            return
+        if path == "/action/join":
+            self._join_post()
+            return
         if not path.startswith("/action/"):
             self.send_error(404)
             return
@@ -346,6 +563,76 @@ class Handler(BaseHTTPRequestHandler):
             close_fds=True,
         )
 
+    # ---- joining this node to a cluster -----------------------------------
+    JOIN_UNIT = "kubeos-node-join"
+    JOIN_HELPER = "/usr/bin/kubeos-node-join"
+
+    def _join_post(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 8192:
+            self._json(400, {"ok": False, "error": "expected a small JSON body"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except ValueError:
+            self._json(400, {"ok": False, "error": "the body is not JSON"})
+            return
+        bundle = str(payload.get("bundle") or "").strip()
+        if not (bundle.startswith("KOSJOIN1.") or bundle.startswith("kubeadm join ")):
+            self._json(400, {"ok": False, "error": "that does not look like a KubeOS join string"})
+            return
+        if not os.path.exists(self.JOIN_HELPER):
+            self._json(500, {"ok": False, "error":
+                             f"{self.JOIN_HELPER} is missing - this node's image has no join helper"})
+            return
+        # A transient unit, not a child process: `kubeadm reset` tears down this node's own
+        # API server, and a unit keeps running through that.
+        #
+        # NO --collect, and a reset-failed first: a collected unit is unloaded the moment it
+        # finishes, so `systemctl show` then reports the *defaults* (`Result=success`) and the
+        # page could not tell a failed join from a finished one (measured on kubeos2). Leaving
+        # the unit behind makes `Result` truthful; the reset is what lets the operator try a
+        # second, corrected join string.
+        subprocess.run(["/usr/bin/systemctl", "reset-failed", self.JOIN_UNIT],
+                       capture_output=True, text=True, timeout=15)
+        result = subprocess.run(
+            ["/usr/bin/systemd-run", "--unit", self.JOIN_UNIT, "--no-block",
+             "--description=KubeOS join: make this node a worker",
+             self.JOIN_HELPER, bundle],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            self._json(500, {"ok": False,
+                             "error": (result.stderr or result.stdout or "systemd-run failed").strip()})
+            return
+        log(f"{self.client_address[0]} started the join as unit {self.JOIN_UNIT}")
+        self._json(202, {"ok": True, "unit": self.JOIN_UNIT,
+                         "detail": "the node is joining; this dashboard goes away when its own "
+                                   "cluster is reset and comes back when the node is Ready"})
+
+    def _join_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        show = subprocess.run(
+            ["/usr/bin/systemctl", "show", self.JOIN_UNIT,
+             "-p", "ActiveState", "-p", "SubState", "-p", "Result"],
+            capture_output=True, text=True, timeout=15,
+        )
+        state = {}
+        for line in (show.stdout or "").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                state[key] = value
+        tail = subprocess.run(
+            ["/usr/bin/journalctl", "-u", self.JOIN_UNIT, "-n", "20", "--no-pager", "-o", "cat"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self._json(200, {"ok": True, "state": state, "log": (tail.stdout or "").strip()})
+
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
@@ -374,6 +661,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if parsed.path == "/nfs":
+            self._nfs_get(parsed)
+            return
+        if parsed.path == "/action/join":
+            self._join_get()
             return
         if parsed.path != "/ws":
             self.send_error(404)

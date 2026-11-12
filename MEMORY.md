@@ -1613,3 +1613,195 @@ asks for, so `main` moved for the first time since the freeze: **both branches a
   refs at `6c71af0`.
 - **Rule reminder for future sessions:** §3 rule 5 still stands — *earlier permission does not carry over*, `main`
   moves only when the user says so in that message.
+
+### Session 2026-11-12 — NFS volumes can be browsed and filled from the dashboard
+
+User: *"nfs is mounting.. but can't able see what contents are in mountpoint in the dashboard.. i want like when i click
+mountpoint it should show inside the contents and also need to add contents to that nfs mountpoint.. when i click add it
+show browse to upload a file"*.
+
+**Why this needed the console and not an API call:** a static NFS PersistentVolume is only a `server` and a `path`.
+Nothing in Kubernetes can list a directory on it without a container holding the mount, and no dashboard button may
+create one (rule 2026-11-12). The node has `mount.nfs`, so `kubeos-console.service` now mounts the export itself.
+
+**Backend (`console.py`).** `GET /nfs?server=&export=&sub=&options=` lists a directory, `PUT /nfs?...&name=&overwrite=`
+writes an uploaded file. Mounting: one mountpoint per `sha256(server:export)[:16]` under `/run/kubeos-nfs/`, reused,
+`mount -t nfs -o <options>` (the PV's own mountOptions, validated against `^[A-Za-z0-9._=:@/-]+$`, default
+`nfsvers=4.1,hard,timeo=600,retrans=2`), guarded by a lock so two browses cannot race. Path safety: `realpath` +
+prefix check, so `../../etc` and a symlink pointing outside the export are both refused (403, verified). Uploads:
+`basename` only, 256 MiB cap, temp file + `os.replace` so an interrupted upload never leaves a half file and an
+interrupted overwrite keeps the old bytes; existing name → 409 unless `overwrite=1`. A handler exception now answers
+500 with a journal traceback instead of closing the connection with no body (`BaseHTTPRequestHandler` would otherwise
+leave the browser with an empty reply — that is how the first 500 hid itself).
+
+**Frontend.** New `src/consoleapi.ts` holds `consoleConfig()`/`consoleFetch()` (moved out of `nodeactions.tsx`, which
+now imports it — one place that knows the token, the port and the certificate hint). The NFS table grew a **Files**
+button per volume, which opens `NfsBrowserDialog`: breadcrumb (`/export` → subdirectories), rows of
+name/size/modified/mode, directories clickable to descend, and **Add file** → a hidden `<input type=file multiple>` →
+`PUT` per file → "uploaded N file(s)" → list refresh. `overwrite=1` is passed, so re-uploading the same name replaces
+it deliberately rather than failing.
+
+**Three bugs the browser found, in order:** (1) `mount` was called as `/sbin/mount`, which does not exist on Debian 13
+(`/sbin` → `usr/sbin`, `mount` lives in `/usr/bin`) — now `shutil.which("mount")`; it surfaced as a silent 500 until
+the traceback logging was added. (2) The CORS preflight advertised `POST, GET, OPTIONS`, so the browser **blocked the
+`PUT`** with "Failed to fetch" *after* a successful 204 preflight — `PUT` added. (3) my first test used the route
+`/c/main/storage/kubeos-storage/nfs`, but `PATH` is `/kubeos-storage/nfs` (the sidebar `parent` is not part of the
+route).
+
+**Verified end to end against a real export** (builder 192.168.122.2 exports `/srv/nfs/kubeos-test` with
+`fsid=2` — an earlier `fsid=0` on a sibling export made the server answer "No such file or directory"):
+API test `~/.kubeos-vm/harness/nfs-api-test.py` → list 200, subdirectory 200, `../../etc` 403, no/bad token 403,
+upload 201, duplicate 409, bad server 502 with the server's own message; the file really landed on the export with the
+right bytes. Browser test `nfs-browse-check.js` → Files button opens the dialog, `docs/` descends, Add file uploads
+`upload-test.txt` (201) and the refreshed list shows it; screenshot `nfs-browser.png`. Releases `3343d402…`,
+`28ec950e…` (final); plugin `main.js` `7fac7bac…`; `console.py` `a3f0ab3f…`.
+
+Left in place on the node for the user to click: PV `nfs-browse-test` (`192.168.122.2:/srv/nfs/kubeos-test`) and the
+mount at `/run/kubeos-nfs/d4f480411edc0d9e`. Uncommitted in `development`.
+
+### Session 2026-11-12 — "Released" explained, and the volume lifecycle is now closed in the page
+
+User: *"i added new nfs and it mounted but it status shoing realed.. what is that mean.. and also i can't able to
+detach again"*.
+
+**This was not a bug, it was a missing explanation and a dead end.** Measured on the node: PV `nfs-kubeos-test` was
+`Released` with `claimRef: default/nfs-kubeos-test` and **no PVC existed**. `Released` is what Kubernetes does to a PV
+whose claim disappeared while its policy is `Retain` (the right policy for an export full of real files): the volume
+keeps a record of a claim that no longer exists, and refuses to go to a new claim while that record is there. The claim
+had been deleted by **Detach** - which is exactly what Detach does (release the claim; the files are untouched). And
+Detach was greyed out afterwards because `claimExists` was false: there was nothing left to detach. Correct behaviour,
+invisible reason.
+
+**What changed.** (1) `Reclaim` button on any volume whose claim is gone (`claim && !claimExists`):
+`ApiProxy.patch('/api/v1/persistentvolumes/<name>', {spec: {claimRef: null}})` - the documented way to reuse a static
+PV; the data is never touched. (2) `Claim` button on an `Available` volume with no claim: creates the PVC pinned with
+`volumeName`, named after the volume, in `default`, with the volume's own capacity/access mode/class - so the loop
+Released → Available → Bound is closed inside the page. (3) The note under the table now spells out
+Available/Bound/Released and why Detach is greyed there, and the Detach tooltip says "the volume is Released, so there
+is nothing left to detach. Use Reclaim, or Remove."
+
+**Verified on the live cluster**, whole lifecycle: `nfs-kubeos-test` was Released → browser clicked **Reclaim** →
+`Available` with an empty `claimRef` → browser clicked **Claim** → PVC `default/nfs-kubeos-test` created, `Bound` to the
+PV, PV `Bound`, 20Gi RWX, no errors and no page errors. Screenshots `nfs-reclaim.png`, `nfs-claim.png`. Release
+`2df5eb06…`, then `5e601396…` (final). Uncommitted in `development`.
+
+Standing note for the NFS page: the volume object and the files are separate lives - **no button here ever deletes
+anything on the export**; only `Remove` deletes the Kubernetes object, and even that leaves the files.
+
+### Session 2026-11-12 — the dashboard now serves from EVERY node (Proxmox model), proven on 2 nodes
+
+User installed a second VM (`kubeos2`, 192.168.122.6) and asked for *"dashboard access not only limited for just 2
+nodes.. but as much as how many nodes added into cluster"*. Chosen architecture (after evaluating NodePort, nginx,
+Keepalived): **run the same two services on every node, same ports** — the Proxmox `pveproxy` model, and here it is even
+simpler because the dashboard is a pure kubeconfig client, so N copies read the same etcd.
+
+**Proven live, not theorised:**
+
+| URL | Cluster shown | Shell lands on |
+|---|---|---|
+| `https://192.168.122.5:30443` | `main`, kubeos + kubeos2 both Ready | `root@kubeos:/#` (192.168.122.5) |
+| `https://192.168.122.6:30443` | the same cluster | `root@kubeos2:/#` (192.168.122.6) |
+
+Zero page errors on both. Per-node actions therefore need **no** cross-node networking and no origin exception — each
+dashboard talks to the console service on its own host, so `Restart`/`Power off`/`Shell` act on the node whose address
+you typed. The two registry files (`consoleapi.ts`, `nodeactions.tsx`) already used `window.location.hostname`, which is
+what makes this work by construction.
+
+**Token convergence gap found and worked around:** `install.sh` generates the console token only when
+`/etc/kubeos-dashboard/console.token` is missing, then **overwrites** the Secret. Installing on a second node therefore
+replaces the cluster-wide token with that node's and breaks the first node's browser. Today the fix was to copy node 1's
+token file to node 2 before installing; the code change is for `install.sh` to adopt the token **from the Secret** when
+its local file is absent (not yet written).
+
+**A "one value per cluster" Secret must be adopt-or-create, never apply (2026-11-12 15:58).** The CA Secret used
+`kubectl apply`, so the last node to install replaced the cluster's CA with its own — two CAs with the *same subject*
+(`O=KubeOS, CN=KubeOS Cluster CA`), each leaf verifying locally and failing on the other node. Strict TLS caught it
+(`kubeos2:30443 -> CERTIFICATE_VERIFY_FAILED` while `openssl verify -CAfile ca.crt tls.crt` returned OK on the same
+node); fingerprints proved it. `install.sh` now publishes the CA **only when the cluster has none** (first writer wins)
+and every other node adopts it, and its local-copy branch only applies when there is no cluster CA at all. Same pattern
+as the console token and the join string: one name per cluster, adopt-or-create. Recovered by deleting the Secret,
+removing kubeos2's local CA, re-installing on kubeos1 then kubeos2, and finishing the join by hand. Release
+`9248d889…`.
+
+**Second fresh-ISO test: both dashboards installed by hand, login + CA working (2026-11-12 15:52).** Rebuilt ISO,
+`kubeos1`/`kubeos2` re-installed at 192.168.122.5/.6, release `dd190d83…` on both: `kubeos-dashboard`,
+`kubeos-dashboard-auth` and `kubeos-console` active, login page on `:30443`, `/healthz` on `:30444`, 0 Pods, each
+dashboard showing its own one-node cluster, strict TLS passing on all four endpoints. Note for the operator: two
+separate clusters mean **two CAs** until the join, so both were imported into the browser store
+(`KubeOS Cluster CA (kubeos1)` / `(kubeos2)`); after the join and the reinstall with the control plane's
+`admin.conf`, kubeos2 adopts kubeos1's CA and the second entry can go. This is still the manual step the ISO
+integration will remove.
+
+**One cluster CA, so HTTPS stops warning on every node (2026-11-12 15:20).** User: *"what about certificate https
+error on..?"*. Each node used to sign its own certificate, so a browser warned once per node and per port and kept the
+"Not secure" badge afterwards. `install.sh` now creates `KubeOS Cluster CA` (RSA-3072, 10 years, openssl) on the first
+node, publishes cert **and key** as Secret `kubeos-system/kubeos-dashboard-ca`, and any other node **adopts** it
+(same pattern as the console token) and signs its own leaf with **all nodes' InternalIPs** + localhost + hostname as
+SANs. `tls.crt` = leaf + CA; both units and the console use it. The gateway serves the CA at `/kubeos-ca.crt` with no
+login (public file, and the browser must trust it first) with `application/x-x509-ca-cert` so the download behaves.
+`--self-signed` restores the old behaviour, `--ca-cert/--ca-key` uses a CA you own. Verified with strict TLS (only the
+downloaded CA as anchor, hostname checking on) on both nodes and both ports, `openssl verify` OK, login + API over it.
+Re-run on the other nodes after adding a node to refresh their SAN lists.
+
+**The dashboard has a Proxmox-style login now, and that closed a real hole (2026-11-12 15:10).** User: *"fix
+dashboard login with root password instead of token like proxmox dashboard"*. Until now Headlamp — which only knows
+the kubeconfig it was given — accepted every request that reached `:30443`, i.e. **cluster-admin for anyone on the
+LAN, no password**. New component `deploy/binary/authproxy.py` + `kubeos-dashboard-auth.service`: the gateway owns the
+public port, Headlamp moves to `127.0.0.1:30445`, the gateway serves a branded login page, checks the password against
+`/etc/shadow` (crypt(3) through ctypes; python3.13 dropped `crypt`, and there is no python3-pam in Debian), allows root
+or a `sudo` member, rate-limits 5 failures/address/5 min, and sets an HMAC `kubeos_session` cookie (12 h, HttpOnly +
+Secure + SameSite=Strict, `/kubeos-logout` clears it). All proxying — frontend, `/clusters/...` API, **WebSocket
+upgrades** for exec/logs, chunked streams — is transparent, so `kubeos-branding` and the console stayed untouched.
+`install.sh` grew `--no-login` (the old exposure) and `--session-hours`; `uninstall.sh` stops the new unit;
+`build-binary.sh` ships the two new files. Release `953c1dd6…`, installed and verified on both nodes. Traps worth
+keeping: the shadow salt needs `"$" + "$".join(hash.split("$")[1:4])` (splitting a `$`-leading hash gives an empty
+first element, so crypt() can never match and every login fails); the upstream hop must be HTTPS because Headlamp keeps
+its own TLS (plain HTTP gets Go's "Client sent an HTTP request to an HTTPS server"); and a forwarded response with no
+Content-Length must be re-framed as chunked or streams never end.
+
+**The token join worked, and it forced one real change: the console token belongs to the CLUSTER (2026-11-12
+14:50).** The user pressed Generate token on kubeos1 and pasted it on kubeos2: the node joined (`kubeos-node-join`
+`Result=success`, both nodes Ready, 0 Pods). kubeos2's dashboard then showed Headlamp's
+"Failed to get authentication information" — **not a bug**: a joined node has only a kubelet identity, and its
+`/etc/kubeos-dashboard/kubeconfig` still pointed at the cluster `kubeadm reset` had deleted, so the fix is to
+reinstall it with the control plane's `admin.conf` (`./install.sh --kubeconfig <cp>/admin.conf`). That install
+exposed a real defect: the console token was published as the cluster-wide Secret
+`kubeos-system/kubeos-console-token`, one name shared by every node, so a **per-machine** token meant installing the
+dashboard on node 2 overwrote node 1's token and its Shell button would answer 401. `install.sh` now reads the
+existing Secret and **adopts** it (`kubectl get secret … -o jsonpath='{.data.token}' | base64 -d`), which is why
+both nodes' consoles now accept the same token; to rotate, delete the Secret and re-run on each node — the first
+generates, the rest adopt. Release `e4671ea2…`, verified on both nodes (`GET /action/join` 200 with the cluster
+token on :30444 of each).
+
+**Installed on a fresh ISO pair and verified end to end from the host (2026-11-12 14:25).** `kubeos1`
+(192.168.122.5) and `kubeos2` (192.168.122.6), rebuilt ISO, both `install.sh --kubeconfig
+/etc/kubernetes/admin.conf` from release `10e2429c…`: `kubeos-dashboard` + `kubeos-console` active on both,
+`:30443` and `:30444/healthz` answer over the LAN (the certificate is per node, so `-k`/accept-once per host),
+`/clusters/main/api/v1/nodes` returns exactly that node Ready, the console Secret is readable through the
+dashboard's own API proxy (that is what the Join page and Shell do first), `kubectl get pods -A` empty, and the
+deployed plugin contains `action/join`. This is the state the user's manual token test starts from.
+
+**Joining is now a button and creates NOTHING in the cluster (2026-11-12 13:40).** The "Join node" page no
+longer creates a privileged Job + `nsenter` (that was the last Pod-creating button, and `AGENTS.md` §0.1 forbids
+it): `startSelfJoin()` is one POST to `kubeos-console.service` — `POST /action/join {bundle}`, started as a
+transient systemd unit (`systemd-run --no-block kubeos-node-join <join string>`), read back with
+`GET /action/join` (state + last 20 journal lines). `console.py` grew those two handlers plus a
+`JOIN_UNIT`/`JOIN_HELPER` pair, `HELPER_IMAGE`/`CRI_SOCKET`/`bootstrapScript()`/`ownNodeName()` are gone, and
+`readClusterInfo()` now returns its own `ClusterInfo` type so the two long-standing `tsc` errors (`JoinBundle`
+required `token`) are fixed — `npx tsc --noEmit` is clean. Two traps: `systemd-run --collect` unloads the unit
+when it finishes, so `Result` reads `success` for a *failed* join (no `--collect`; `reset-failed` first instead),
+and an undecodable string used to produce a python traceback (now one sentence, from
+`kubeos-node-join` in the ISO tree). Release `10e2429c…`, verified on kubeos2 (403 / 400 / 202 + truthful
+`Result=exit-code`, cluster untouched). **The join itself is untested on purpose** — the user runs it on fresh
+VMs by pasting a token, which is the point of the test.
+
+**Remaining gaps for real N-node (all measured today):** per-node self-signed certificate → the browser warns once per
+node IP (a cluster cert carrying every node IP as SAN, plus one cluster CA, fixes it properly); cross-node **pod**
+networking does not exist yet (bridge+host-local per node, so pods on kubeos cannot reach pods on kubeos2 — Calico is
+baked into the ISO but the native path does not use it); the ISO has to install the release + both units on every node
+(`node-join`), which is what makes "as many nodes as you like" automatic instead of manual.
+Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
+
+- 2026-11-12 13:40 "Join this node" is a console POST, not a Pod (user: *"i will add 2 nodes manually with token in
+  dashboard.. so i can understand it and testing"*). console.py `POST/GET /action/join` → transient unit; addnode.tsx
+  rewritten; tsc clean; release `10e2429c…` on kubeos2 and on the builder. See the note above §7 for the two traps.

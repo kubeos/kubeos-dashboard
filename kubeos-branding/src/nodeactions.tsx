@@ -63,6 +63,7 @@ import DialogTitle from "@mui/material/DialogTitle";
 import Typography from "@mui/material/Typography";
 import React from "react";
 import { BRAND } from "./brand";
+import { certificateHint, consoleConfig } from "./consoleapi";
 
 const NAMESPACE = "kubeos-system";
 /**
@@ -193,11 +194,8 @@ function currentCluster(): string {
  *
  * So the action is a POST to the node's console service (see console.py), which already runs
  * as root on the host: `POST /action/restart` is the entire implementation. Nothing is
- * created, so nothing can be left behind, and the answer comes back before systemd takes
+ * created, so nothing can be left behind, and the service answers 202 before systemd takes
  * the machine down.
- *
- * The token is the same per-machine Secret the shell uses, and the reply has to arrive
- * before the network goes away - both handled in console.py.
  */
 async function requestNodeAction(
   action: PowerAction,
@@ -210,17 +208,13 @@ async function requestNodeAction(
     response = await fetch(target, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
-      // The console needs a moment to answer before the machine goes down; a long timeout
-      // would only hang the dialog.
       signal: AbortSignal.timeout(15000),
     });
   } catch (reason: any) {
     throw new Error(
-      `could not reach the node console on port ${port} - if this browser has never opened https://${
-        window.location.hostname
-      }:${port}/ , do that once and accept the certificate warning (${String(
+      `could not reach the node console on port ${port}. ${certificateHint(port)} (${String(
         reason?.message ?? reason
-      )}).`
+      )})`
     );
   }
   if (response.status === 202) {
@@ -233,56 +227,6 @@ async function requestNodeAction(
     detail = response.statusText;
   }
   throw new Error(`${response.status} ${detail || response.statusText}`.trim());
-}
-
-/**
- * THE SHELL IS ON THE NODE, AND NOTHING IS CREATED IN THE CLUSTER TO GET IT.
- *
- * History, because the shape of this code only makes sense with it: the first version opened
- * a shell by creating a privileged Pod and `kubectl exec`-ing into it, because the browser
- * can only reach headlamp-server (a Kubernetes API proxy) and Kubernetes has no "run on the
- * host" call. That worked, but the user rejected it (2026-11-12: *"yes i need shell without
- * pod creation"*). So the node now runs `kubeos-console.service` - the PTY service in
- * `deploy/binary/console.py` - and this file only opens a WebSocket to it and paints an
- * xterm. A click creates no object, takes no privileged container and leaves nothing behind.
- *
- * WHY A TOKEN FROM A SECRET, and what it is worth: the console listens on its own port with
- * the dashboard's certificate, so it needs *some* authentication of its own - the token
- * stops a port scan or another web page from opening a root shell. It is fetched through the
- * Kubernetes API rather than baked into the bundle, so it is per machine and never ships in
- * the ISO. Anyone who can read that Secret can open the shell, but the dashboard's own
- * kubeconfig is cluster-admin with no login, so that is the same set of people who can
- * already do anything here. It is a lock on a door in a room, and it is honest about it.
- *
- * THE CERTIFICATE: the console shares the dashboard's self-signed certificate, but browsers
- * scope trust per port and refuse a WebSocket to an untrusted one with no way to accept it.
- * So the component catches a failed connection and tells the operator to open
- * `https://<node>:30444/` once and accept the warning - the console serves a small page there
- * for exactly that purpose.
- */
-async function consoleConfig(): Promise<{ token: string; port: number }> {
-  let secret: any;
-  try {
-    secret = await apiJson<any>(
-      `/api/v1/namespaces/${NAMESPACE}/secrets/${CONSOLE_SECRET}`
-    );
-  } catch (reason: any) {
-    throw new Error(
-      `the host console is not installed on this node (Secret ${NAMESPACE}/${CONSOLE_SECRET} is missing): re-run install.sh. ${String(
-        reason?.message ?? reason
-      )}`
-    );
-  }
-  const data = secret?.data ?? {};
-  const decode = (value: any) => (value ? atob(String(value)) : "");
-  const token = decode(data.token);
-  if (!token) {
-    throw new Error(
-      `Secret ${NAMESPACE}/${CONSOLE_SECRET} has no token: re-run install.sh`
-    );
-  }
-  const port = Number(decode(data.port)) || CONSOLE_PORT;
-  return { token, port };
 }
 
 /**

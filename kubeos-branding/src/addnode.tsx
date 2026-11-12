@@ -13,12 +13,13 @@
  *      discards the one-node cluster a fresh KubeOS install always creates, and runs
  *      the official `kubeadm join` against the control plane.
  *
- * WHY there is no SSH and no credential here any more: the dashboard pod already runs
- * ON the node that must join. A privileged one-shot pod therefore reaches the host
- * through `nsenter` and starts the join as a **transient systemd unit**, which keeps
- * running after the local cluster (and with it this dashboard) is torn down by
- * `kubeadm reset`. So the join needs no password, no key, and nothing is stored
- * anywhere -- the only secret involved is the token, which expires.
+ * WHY there is no SSH, no key and no pod: the dashboard already runs ON the node that
+ * must join, and that node runs `kubeos-console.service` (the same service behind Shell,
+ * Restart, Power off and the NFS browser). "Join this node" is one authenticated POST to
+ * it; the service starts `kubeos-node-join` as a **transient systemd unit**, which keeps
+ * running after `kubeadm reset` tears down the local cluster - and with it this dashboard.
+ * Nothing is created in the cluster (user rule 2026-11-12: no button may create a pod).
+ * The only secret involved is the bootstrap token, which expires.
  */
 import { ApiProxy, registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
 import { SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
@@ -28,11 +29,11 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import React from 'react';
 
+import { consoleConfig, consoleFetch, consoleJson } from './consoleapi';
+
 const NAMESPACE = 'kubeos-system';
-const HELPER_IMAGE = 'ghcr.io/skmdab/kubeos-join-helper:0.1.0';
 const TOKEN_TTL_MINUTES = 60;
 const TOKEN_PREFIX = 'KOSJOIN1.';
-const CRI_SOCKET = 'unix:///run/containerd/containerd.sock';
 
 /* -------------------------------------------------------------------------- */
 /* Join string: endpoint + token + CA hash, one paste-able value              */
@@ -135,7 +136,13 @@ async function certificateHash(caDataBase64: string): Promise<string> {
     .join('')}`;
 }
 
-async function readClusterInfo(): Promise<{ endpoint: string; caHash: string }> {
+/** What a control plane can tell a joining node before any token exists. */
+interface ClusterInfo {
+  endpoint: string;
+  caHash: string;
+}
+
+async function readClusterInfo(): Promise<ClusterInfo> {
   const configMap: any = await ApiProxy.request(
     '/api/v1/namespaces/kube-public/configmaps/cluster-info'
   );
@@ -191,97 +198,31 @@ async function createBootstrapToken(): Promise<string> {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Joining: a privileged one-shot pod that hands the work to a systemd unit   */
+/* Joining: the node's own console service does the work, never a pod          */
 /* -------------------------------------------------------------------------- */
 
-function bootstrapScript(bundle: JoinBundle): string {
-  return `#!/bin/sh
-# Started by the KubeOS dashboard as a transient systemd unit, so it survives the
-# moment kubeadm reset tears down this machine's single-node cluster.
-set -e
-systemctl stop kubeos-cluster-setup.service 2>/dev/null || true
-mkdir -p /var/lib/kubeos
-date -u +'%Y-%m-%dT%H:%M:%SZ' > /var/lib/kubeos/initialized
-kubeadm reset -f --cri-socket ${CRI_SOCKET} >/dev/null 2>&1 || true
-rm -rf /etc/kubernetes /var/lib/etcd /etc/cni/net.d /var/lib/kubelet/* /root/.kube
-systemctl enable containerd.service >/dev/null 2>&1 || true
-systemctl start containerd.service >/dev/null 2>&1 || true
-n=0
-while [ ! -S /run/containerd/containerd.sock ] && [ $n -lt 60 ]; do n=$((n + 1)); sleep 1; done
-exec kubeadm join ${bundle.endpoint} --token ${bundle.token} --discovery-token-ca-cert-hash ${bundle.caHash} --cri-socket ${CRI_SOCKET}
-`;
-}
-
-/** The node this dashboard pod runs on, so the bootstrap pod cannot land elsewhere. */
-async function ownNodeName(): Promise<string | undefined> {
-  try {
-    const pods: any = await ApiProxy.request(`/api/v1/namespaces/${NAMESPACE}/pods`);
-    const own = (pods?.items ?? []).find((pod: any) =>
-      String(pod.metadata?.name ?? '').startsWith('kubeos-dashboard-headlamp')
-    );
-    return own?.spec?.nodeName;
-  } catch {
-    return undefined;
-  }
-}
-
+/**
+ * Hand the join string to `kubeos-console.service` on this node.
+ *
+ * WHY NOT A POD: user decision 2026-11-12 - no dashboard button may create a Pod, now or
+ * later. The old version created a privileged Job that `nsenter`ed into the host; this one
+ * is a single authenticated POST, and the service runs the join as a transient **systemd
+ * unit**, which is also what lets it keep going after `kubeadm reset` deletes the cluster
+ * this page is talking to.
+ *
+ * The service answers 202 as soon as the unit is started, so the caller must tell the
+ * operator that this page is about to lose its cluster - not wait for a result that cannot
+ * arrive here.
+ */
 async function startSelfJoin(bundle: JoinBundle): Promise<string> {
-  const suffix = randomToken(6);
-  const jobName = `kubeos-bootstrap-${suffix}`;
-  const unitName = `kubeos-self-join-${suffix}`;
-  const scriptB64 = btoa(
-    String.fromCharCode(...new TextEncoder().encode(bootstrapScript(bundle)))
-  );
-  const node = await ownNodeName();
-
-  const job = {
-    apiVersion: 'batch/v1',
-    kind: 'Job',
-    metadata: {
-      name: jobName,
-      namespace: NAMESPACE,
-      labels: { 'kubeos.io/bootstrap': 'self' },
-    },
-    spec: {
-      backoffLimit: 0,
-      ttlSecondsAfterFinished: 300,
-      template: {
-        metadata: { labels: { 'kubeos.io/bootstrap': 'self' } },
-        spec: {
-          restartPolicy: 'Never',
-          hostPID: true,
-          ...(node ? { nodeSelector: { 'kubernetes.io/hostname': node } } : {}),
-          tolerations: [{ operator: 'Exists' }],
-          containers: [
-            {
-              name: 'bootstrap',
-              image: HELPER_IMAGE,
-              imagePullPolicy: 'IfNotPresent',
-              securityContext: { privileged: true },
-              volumeMounts: [{ name: 'host', mountPath: '/host' }],
-              // Write the script onto the host, then hand it to systemd so the join
-              // continues after this pod's cluster disappears.
-              command: [
-                '/bin/sh',
-                '-c',
-                `set -e
-echo ${scriptB64} | base64 -d > /host/root/kubeos-self-join.sh
-chmod 0700 /host/root/kubeos-self-join.sh
-nsenter -t 1 -m -u -i -n -p -- systemd-run \\
-  --unit=${unitName} --collect --property=Type=oneshot \\
-  --property=StandardOutput=journal --property=StandardError=journal \\
-  /bin/sh /root/kubeos-self-join.sh`,
-              ],
-            },
-          ],
-          volumes: [{ name: 'host', hostPath: { path: '/' } }],
-        },
-      },
-    },
-  };
-
-  await ApiProxy.post(`/apis/batch/v1/namespaces/${NAMESPACE}/jobs`, job);
-  return jobName;
+  const config = await consoleConfig();
+  const response = await consoleFetch(config, '/action/join', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bundle: encodeJoin(bundle) }),
+  });
+  const body = await consoleJson<{ unit?: string; detail?: string }>(response);
+  return body.detail ?? `the join is running as ${body.unit ?? 'a systemd unit'} on this node`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -322,14 +263,14 @@ function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) 
 /* -------------------------------------------------------------------------- */
 
 function JoinNodePage() {
-  const [bundle, setBundle] = React.useState<JoinBundle | null>(null);
+  const [bundle, setBundle] = React.useState<ClusterInfo | null>(null);
   const [generated, setGenerated] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [generateError, setGenerateError] = React.useState<string | null>(null);
 
   const [pasted, setPasted] = React.useState('');
   const [joinError, setJoinError] = React.useState<string | null>(null);
-  const [joinJob, setJoinJob] = React.useState<string | null>(null);
+  const [joinNotice, setJoinNotice] = React.useState<string | null>(null);
   const [joining, setJoining] = React.useState(false);
 
   React.useEffect(() => {
@@ -376,8 +317,7 @@ function JoinNodePage() {
         }
         // If this node cannot read its own cluster-info any more, let the join proceed.
       }
-      const jobName = await startSelfJoin(decoded);
-      setJoinJob(jobName);
+      setJoinNotice(await startSelfJoin(decoded));
       setPasted('');
     } catch (err: any) {
       setJoinError(String(err?.message ?? err));
@@ -461,12 +401,12 @@ function JoinNodePage() {
           </Typography>
         )}
 
-        {joinJob && (
+        {joinNotice && (
           <Typography variant="body2" sx={{ mt: 2 }}>
-            Join started on this node (job <Mono>{joinJob}</Mono>). A transient systemd
-            unit now runs independently of this cluster, so it
-            finishes even though this dashboard is about to disappear. Check on the
-            control plane: <Mono>kubectl get nodes</Mono>
+            Join started on this node. {joinNotice}. Nothing was created in the cluster - the
+            join runs as a transient systemd unit on the host, so it finishes even though this
+            dashboard is about to disappear. Check on the control plane:{' '}
+            <Mono>kubectl get nodes</Mono>
           </Typography>
         )}
       </SectionBox>

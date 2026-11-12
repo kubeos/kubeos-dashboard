@@ -55,6 +55,7 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import React from "react";
 import { BRAND } from "./brand";
+import { consoleConfig, consoleFetch, consoleJson } from "./consoleapi";
 
 /** Sidebar/route identity. `PARENT` is Headlamp's own Storage group. */
 const PARENT = "storage";
@@ -359,6 +360,59 @@ async function detachClaim(claim: string): Promise<void> {
  * Kubernetes API has no such operation for NFS - which is exactly why the dialog
  * says so out loud instead of leaving the user to guess.
  */
+/**
+ * Turn a Released volume back into a usable one.
+ *
+ * WHY THIS EXISTS: with `Retain` (the right policy for an export full of real files) a
+ * deleted claim leaves the PV in phase **Released** with its `claimRef` still recorded -
+ * Kubernetes will not hand that volume to another claim while the reference is there, and
+ * deleting the reference is the documented way to reuse a static PV. Nothing touches the
+ * files: the volume object only stops remembering a claim that no longer exists.
+ *
+ * Reported as "it status showing released.. and also i can't able to detach again"
+ * (2026-11-12): Released means the claim is already gone, so Detach has nothing to release -
+ * Reclaim is the button that applies.
+ */
+async function reclaimVolume(name: string): Promise<void> {
+  await ApiProxy.patch(`/api/v1/persistentvolumes/${name}`, {
+    spec: { claimRef: null },
+  });
+}
+
+/**
+ * Claim an Available volume, so Pods can use it again.
+ *
+ * The other half of Reclaim: a Released volume that has been reclaimed is Available, which
+ * still means "nobody is using it". This creates the claim, pinned with `volumeName` so the
+ * binder cannot pick a different export of the same size. The claim is named after the
+ * volume - one volume, one claim - which is what a single-node appliance actually wants.
+ */
+async function attachClaim(volume: NfsVolume): Promise<string> {
+  const namespace = "default";
+  const claim = {
+    apiVersion: "v1",
+    kind: "PersistentVolumeClaim",
+    metadata: {
+      name: volume.name,
+      namespace,
+      labels: { "kubeos.in/component": "nfs" },
+    },
+    spec: {
+      accessModes: volume.accessModes.length ? volume.accessModes : ["ReadWriteMany"],
+      ...(volume.storageClassName
+        ? { storageClassName: volume.storageClassName }
+        : {}),
+      volumeName: volume.name,
+      resources: { requests: { storage: volume.capacity } },
+    },
+  };
+  await ApiProxy.post(
+    `/api/v1/namespaces/${namespace}/persistentvolumeclaims`,
+    claim
+  );
+  return `${namespace}/${volume.name}`;
+}
+
 async function removeVolume(name: string): Promise<void> {
   await ApiProxy.remove(`/api/v1/persistentvolumes/${name}`);
 }
@@ -774,6 +828,322 @@ function AddNfsDialog({
 
 type VolumeAction = { kind: "detach" | "remove"; volume: NfsVolume } | null;
 
+/* ---- browsing and filling the export ------------------------------------ */
+
+type Entry = {
+  name: string;
+  dir: boolean;
+  link?: boolean;
+  size: number;
+  mtime: number;
+  mode?: string;
+};
+
+const SIZE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+function humanSize(bytes: number): string {
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${SIZE_UNITS[unit]}`;
+}
+
+function humanTime(seconds: number): string {
+  if (!seconds) {
+    return "-";
+  }
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+/**
+ * Browse one NFS volume, and put files into it.
+ *
+ * WHY THIS TALKS TO THE CONSOLE: a static NFS volume is only a server and a path. Nothing in
+ * Kubernetes can list a directory on it without a container holding the mount, and no
+ * dashboard button may create a container (user decision 2026-11-12). The node has mount.nfs,
+ * so `kubeos-console.service` mounts the export under /run/kubeos-nfs/<hash> and answers
+ * `GET /nfs` (list) and `PUT /nfs` (write) - the same bytes a Pod claiming this volume sees.
+ *
+ * The mount is kept while it is used and is not torn down on close: remounting on every
+ * folder click would make the browser feel broken on a slow server.
+ */
+function NfsBrowserDialog({
+  volume,
+  onClose,
+}: {
+  volume: NfsVolume;
+  onClose: () => void;
+}) {
+  const [path, setPath] = React.useState("");
+  const [entries, setEntries] = React.useState<Entry[] | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [progress, setProgress] = React.useState<string | null>(null);
+  const input = React.useRef<HTMLInputElement | null>(null);
+  const options = (volume.mountOptions ?? []).join(",");
+
+  const query = (extra: Record<string, string> = {}) => {
+    const params = new URLSearchParams({
+      server: volume.server,
+      export: volume.path,
+      sub: path,
+      ...(options ? { options } : {}),
+      ...extra,
+    });
+    return `/nfs?${params.toString()}`;
+  };
+
+  const load = React.useCallback(
+    async (target: string) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const config = await consoleConfig();
+        const response = await consoleFetch(
+          config,
+          `/nfs?${new URLSearchParams({
+            server: volume.server,
+            export: volume.path,
+            sub: target,
+            ...(options ? { options } : {}),
+          }).toString()}`
+        );
+        const body = await consoleJson<{ entries: Entry[]; path: string }>(
+          response
+        );
+        setEntries(body.entries ?? []);
+        setPath(body.path ?? "");
+        if (target === "" && body.entries?.length === 0) {
+          // An empty export is a fact, not an error: say so once, plainly.
+          setError(
+            "This export is empty. Use Add file to put something in it."
+          );
+        }
+      } catch (reason: any) {
+        setEntries(null);
+        setError(String(reason?.message ?? reason));
+      } finally {
+        setBusy(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [volume.server, volume.path, options]
+  );
+
+  React.useEffect(() => {
+    load("");
+  }, [load]);
+
+  const upload = async (files: FileList | null) => {
+    if (!files || files.length === 0) {
+      return;
+    }
+    const config = await consoleConfig();
+    let done = 0;
+    for (const file of Array.from(files)) {
+      setProgress(`uploading ${file.name} (${humanSize(file.size)})…`);
+      try {
+        const response = await consoleFetch(
+          config,
+          query({ name: file.name, overwrite: "1" }),
+          { method: "PUT", body: file, headers: { "Content-Type": "application/octet-stream" } }
+        );
+        await consoleJson(response);
+        done += 1;
+      } catch (reason: any) {
+        setError(`could not upload ${file.name}: ${String(reason?.message ?? reason)}`);
+        break;
+      }
+    }
+    setProgress(done > 0 ? `uploaded ${done} file(s)` : null);
+    if (done > 0) {
+      await load(path);
+    }
+    if (input.current) {
+      input.current.value = "";
+    }
+  };
+
+  return (
+    <Dialog open onClose={onClose} maxWidth="md" fullWidth>
+      <DialogTitle sx={{ pb: 1 }}>
+        <Box sx={{ display: "flex", alignItems: "baseline", gap: 1 }}>
+          <span>{volume.name}</span>
+          <Typography variant="caption" sx={{ ...mono, color: BRAND.text.muted }}>
+            {volume.server}:{volume.path}
+          </Typography>
+        </Box>
+      </DialogTitle>
+      <DialogContent dividers sx={{ minHeight: 320 }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1.5 }}>
+          <Button
+            size="small"
+            onClick={() => load("")}
+            disabled={busy || path === ""}
+            title="Back to the top of the export"
+          >
+            {volume.path === "/" ? "/" : volume.path}
+          </Button>
+          {path
+            .split("/")
+            .filter(Boolean)
+            .map((segment, index, all) => {
+              const target = all.slice(0, index + 1).join("/");
+              return (
+                <React.Fragment key={target}>
+                  <Typography variant="caption" sx={{ color: BRAND.text.muted }}>
+                    /
+                  </Typography>
+                  <Button
+                    size="small"
+                    onClick={() => load(target)}
+                    disabled={busy || index === all.length - 1}
+                    sx={{ minWidth: 0 }}
+                  >
+                    {segment}
+                  </Button>
+                </React.Fragment>
+              );
+            })}
+          <Box sx={{ flex: 1 }} />
+          <input
+            ref={input}
+            type="file"
+            multiple
+            style={{ display: "none" }}
+            onChange={(event) => upload(event.target.files)}
+          />
+          <Button
+            variant="contained"
+            size="small"
+            onClick={() => input.current?.click()}
+            disabled={busy}
+            title="Choose a file from this computer and upload it here"
+          >
+            Add file
+          </Button>
+        </Box>
+
+        {progress && (
+          <Typography variant="caption" sx={{ display: "block", mb: 1, color: BRAND.lime.light }}>
+            {progress}
+          </Typography>
+        )}
+        {error && (
+          <Typography
+            variant="body2"
+            sx={{ mb: 1.5, color: "#E0A030", wordBreak: "break-word" }}
+          >
+            {error}
+          </Typography>
+        )}
+
+        {busy && entries === null && !error && (
+          <Typography variant="body2" sx={{ color: BRAND.text.muted }}>
+            Reading {volume.server}:{volume.path}…
+          </Typography>
+        )}
+
+        {entries !== null && entries.length > 0 && (
+          <Box
+            sx={{
+              border: `1px solid ${BRAND.bg.muted}`,
+              borderRadius: `${BRAND.radius}px`,
+            }}
+          >
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: "minmax(160px,2fr) 90px minmax(140px,1fr) 70px",
+                gap: 2,
+                px: 1.5,
+                py: 0.75,
+                backgroundColor: BRAND.bg.muted,
+              }}
+            >
+              {["Name", "Size", "Modified", "Mode"].map((column) => (
+                <Typography
+                  key={column}
+                  variant="caption"
+                  sx={{
+                    color: BRAND.text.muted,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.06em",
+                  }}
+                >
+                  {column}
+                </Typography>
+              ))}
+            </Box>
+            {entries.map((entry) => (
+              <Box
+                key={entry.name}
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: "minmax(160px,2fr) 90px minmax(140px,1fr) 70px",
+                  gap: 2,
+                  px: 1.5,
+                  py: 0.5,
+                  alignItems: "center",
+                  borderTop: `1px solid ${BRAND.bg.muted}`,
+                  "&:hover": { backgroundColor: BRAND.bg.muted },
+                }}
+              >
+                {entry.dir ? (
+                  <Button
+                    size="small"
+                    onClick={() =>
+                      load(path ? `${path}/${entry.name}` : entry.name)
+                    }
+                    disabled={busy}
+                    sx={{
+                      justifyContent: "flex-start",
+                      minWidth: 0,
+                      px: 0.5,
+                      color: BRAND.lime.light,
+                    }}
+                    title={`Open ${entry.name}`}
+                  >
+                    {entry.name}/
+                  </Button>
+                ) : (
+                  <Typography
+                    variant="body2"
+                    sx={{ ...mono, pl: 0.5, wordBreak: "break-all" }}
+                  >
+                    {entry.name}
+                    {entry.link ? " →" : ""}
+                  </Typography>
+                )}
+                <Typography variant="caption" sx={{ color: BRAND.text.muted }}>
+                  {entry.dir ? "-" : humanSize(entry.size)}
+                </Typography>
+                <Typography variant="caption" sx={{ color: BRAND.text.muted }}>
+                  {humanTime(entry.mtime)}
+                </Typography>
+                <Typography variant="caption" sx={{ ...mono, color: BRAND.text.muted }}>
+                  {entry.mode ?? "-"}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={() => load(path)} disabled={busy}>
+          Refresh
+        </Button>
+        <Button variant="contained" onClick={onClose}>
+          Close
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 function VolumeActionDialog({
   action,
   onClose,
@@ -973,6 +1343,8 @@ function VolumeActionDialog({
 function NfsPage() {
   const { volumes, classPresent, error, loading, reload } = useNfs();
   const [dialogOpen, setDialogOpen] = React.useState(false);
+  // Which volume's export is being browsed. Kept here so the row button can open it.
+  const [browsing, setBrowsing] = React.useState<NfsVolume | null>(null);
   const [action, setAction] = React.useState<VolumeAction>(null);
   const [banner, setBanner] = React.useState<string | null>(null);
 
@@ -1053,7 +1425,7 @@ function NfsPage() {
             "Reclaim",
             "Actions",
           ]}
-          template="minmax(110px,1.1fr) minmax(180px,1.8fr) 80px 120px 80px minmax(130px,1.1fr) 76px 150px"
+          template="minmax(110px,1.1fr) minmax(180px,1.8fr) 80px 120px 80px minmax(130px,1.1fr) 76px 210px"
           rows={volumes.map((volume) => [
             <Typography key="n" variant="body2" sx={mono}>
               {volume.name}
@@ -1112,18 +1484,78 @@ function NfsPage() {
             <Box key="a" sx={{ display: "flex", gap: 0.5 }}>
               <Button
                 size="small"
-                onClick={() => setAction({ kind: "detach", volume })}
-                disabled={!volume.claimExists}
-                title={
-                  volume.claimExists
-                    ? `Release ${volume.claim}`
-                    : volume.claim
-                    ? `${volume.claim} no longer exists`
-                    : "No claim to release"
-                }
+                sx={{ color: BRAND.lime.light }}
+                onClick={() => setBrowsing(volume)}
+                title={`Browse ${volume.server}:${volume.path} and add files`}
               >
-                Detach
+                Files
               </Button>
+              {volume.phase === "Available" && !volume.claim && (
+                <Button
+                  size="small"
+                  onClick={() => {
+                    attachClaim(volume)
+                      .then((name) => {
+                        setBanner(
+                          `${volume.name} is claimed as ${name} - a Pod can mount it now.`
+                        );
+                        reload();
+                      })
+                      .catch((reason: any) =>
+                        setBanner(
+                          `could not claim ${volume.name}: ${String(
+                            reason?.message ?? reason
+                          )}`
+                        )
+                      );
+                  }}
+                  title={`Create the claim ${volume.name} in namespace default, pinned to this volume`}
+                >
+                  Claim
+                </Button>
+              )}
+              {volume.claim && !volume.claimExists ? (
+                // Released (or Failed): the claim is gone, so there is nothing to detach -
+                // the useful action is to forget the old claim so the volume can be used
+                // again. The files on the export are untouched either way.
+                <Button
+                  size="small"
+                  onClick={() => {
+                    reclaimVolume(volume.name)
+                      .then(() => {
+                        setBanner(
+                          `${volume.name} is Available again - it can be claimed now. The files on the export were not touched.`
+                        );
+                        reload();
+                      })
+                      .catch((reason: any) =>
+                        setBanner(
+                          `could not reclaim ${volume.name}: ${String(
+                            reason?.message ?? reason
+                          )}`
+                        )
+                      );
+                  }}
+                  title={`Forget the claim ${volume.claim} so this volume can be used again (nothing on the export is deleted)`}
+                >
+                  Reclaim
+                </Button>
+              ) : (
+                <Button
+                  size="small"
+                  onClick={() => setAction({ kind: "detach", volume })}
+                  disabled={!volume.claimExists}
+                  title={
+                    volume.claimExists
+                      ? `Release ${volume.claim}`
+                      : volume.claim
+                      ? `${volume.claim} no longer exists - the volume is Released, so there is nothing left to detach. Use Reclaim, or Remove.`
+                      : "No claim to release: this volume is Available"
+                  }
+                >
+                  Detach
+                </Button>
+              )}
               <Button
                 size="small"
                 sx={{ color: "#E0A030" }}
@@ -1141,10 +1573,15 @@ function NfsPage() {
         the claim, and neither does local-path. Watch the export on the server.
       </Note>
       <Note>
-        A volume in <strong>Released</strong> or <strong>Failed</strong> means
-        its claim was deleted and the PV stayed behind because the policy is{" "}
-        <code>Retain</code>. Remove it from Storage → Persistent Volumes; the
-        files on the export are never deleted by Kubernetes.
+        What the status means: <strong>Available</strong> is a volume nobody
+        has claimed; <strong>Bound</strong> is one a claim is using;{" "}
+        <strong>Released</strong> means the claim was deleted while the volume
+        kept the <code>Retain</code> policy, so Kubernetes still remembers a
+        claim that no longer exists and will not give the volume to another one.
+        That is why <strong>Detach</strong> is greyed out on a Released volume -
+        there is nothing left to detach. Use <strong>Reclaim</strong> to make it{" "}
+        <strong>Available</strong> again (the files on the export are never
+        touched), or <strong>Remove</strong> to delete the volume object itself.
       </Note>
       {!classPresent && (
         <Note>
@@ -1160,6 +1597,13 @@ function NfsPage() {
         onClose={() => setDialogOpen(false)}
         onCreated={onCreated}
       />
+
+      {browsing && (
+        <NfsBrowserDialog
+          volume={browsing}
+          onClose={() => setBrowsing(null)}
+        />
+      )}
 
       <VolumeActionDialog
         action={action}

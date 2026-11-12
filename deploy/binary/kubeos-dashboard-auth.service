@@ -1,0 +1,45 @@
+# KubeOS dashboard login gateway - the Proxmox-style "log in with this node's password".
+#
+# WHY THIS EXISTS: Headlamp has no local login. It authenticates with the kubeconfig it was
+# given, so with only kubeos-dashboard.service running, anyone who can reach the port is
+# cluster-admin without typing anything. This unit owns the public HTTPS port and asks for a
+# local account (root, or a member of `sudo`) before it lets a single request through to
+# Headlamp, which is moved behind it on 127.0.0.1.
+#
+# WHY ROOT: it verifies the password against /etc/shadow with crypt(3), exactly like the
+# console's login prompt. Nothing is written and no shell is reachable through it, so the
+# privileges stop at "read the shadow hash and proxy HTTP".
+[Unit]
+Description=KubeOS dashboard login gateway
+Documentation=https://github.com/skmdab/kubeos-dashboard
+# Upstream must exist before a request can be proxied, but this unit is what the browser
+# talks to, so it starts regardless and answers 502 until Headlamp is listening.
+After=kubeos-dashboard.service network-online.target
+Wants=kubeos-dashboard.service network-online.target
+ConditionPathExists=/etc/kubeos-dashboard/tls.crt
+ConditionPathExists=/etc/kubeos-dashboard/session.key
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/kubeos-dashboard-auth
+ExecStart=/usr/bin/python3 /usr/lib/kubeos-dashboard/authproxy.py $AUTH_ARGS
+Restart=always
+RestartSec=3
+
+# Hardening: it reads two files in /etc and writes nothing at all.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -179,7 +179,11 @@ cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kube
 
 cp "$HERE/install.sh" "$HERE/uninstall.sh" "$STAGE/"
 cp "$HERE/kubeos-dashboard.service" "$HERE/kubeos-dashboard.env.example" "$STAGE/systemd/"
-cp "$HERE/kubeos-console.service" "$STAGE/systemd/"
+cp "$HERE/kubeos-console.service" "$HERE/kubeos-dashboard-auth.service" "$STAGE/systemd/"
+# The login gateway: asks for this node's password before Headlamp, which has no login of
+# its own. It sits on the public port, so it is part of the release, not of the node.
+cp "$HERE/authproxy.py" "$STAGE/authproxy.py"
+chmod 0755 "$STAGE/authproxy.py"
 # The host console: the node's own PTY over TLS, so the Shell button creates no Pod.
 cp "$HERE/console.py" "$STAGE/console/console.py"
 chmod 0644 "$STAGE/console/console.py"
