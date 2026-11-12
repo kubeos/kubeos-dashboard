@@ -25,6 +25,10 @@ import "./nfs";
 // effect: it calls registerAppBarAction. They act on the NODE, so they belong in
 // the header rather than on a resource page.
 import "./nodeactions";
+// The node health card on the Node page: systemd, disks and versions, read from the host.
+import "./nodehealth";
+// The etcd snapshots page: take/list/download backups through the node's own console.
+import "./snapshots";
 import { kubeosTheme } from "./theme";
 
 /**

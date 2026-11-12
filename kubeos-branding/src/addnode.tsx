@@ -24,6 +24,7 @@
 import { ApiProxy, registerRoute, registerSidebarEntry } from '@kinvolk/headlamp-plugin/lib';
 import { SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import Box from '@mui/material/Box';
+import CircularProgress from '@mui/material/CircularProgress';
 import Button from '@mui/material/Button';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
@@ -336,6 +337,89 @@ async function startSelfJoin(bundle: JoinBundle): Promise<string> {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Watching a join to the end - deliberately OUTSIDE React                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * WHY MODULE SCOPE: by the end of a join this dashboard's own API server has been replaced, so
+ * Headlamp is painting "Lost connection / Bad Gateway" and may unmount the page that started the
+ * join at any moment. A watcher living in a component dies with it, which is exactly what the
+ * user hit: the join finished, the tab stayed on the red error, and only a manual reload brought
+ * the dashboard back (2026-11-12). A timer on `window` is not unmounted.
+ *
+ * WHY THE RELOAD WAITS FOR `/healthz`: the join ends by restarting the three dashboard units. A
+ * reload fired in that gap lands on the BROWSER'S error page, which is the same complaint in
+ * another costume; so the tab is reloaded only once the gateway answers again.
+ */
+const JOIN_STATES_RUNNING = ['active', 'activating', 'deactivating', 'reloading'];
+const JOIN_START_GRACE_MS = 8000;
+const RELOAD_TRIES = 90; // 90 x 2 s = 3 min, then reload regardless
+let joinWatchTimer: number | undefined;
+
+function isJoinUnitRunning(state: any): boolean {
+  return JOIN_STATES_RUNNING.includes(String(state?.state?.ActiveState ?? ''));
+}
+
+async function readJoinUnitState(): Promise<any | null> {
+  try {
+    const config = await consoleConfig();
+    const answer = await consoleFetch(config, '/action/join');
+    return await consoleJson<any>(answer);
+  } catch {
+    // the console restarts with the rest of the dashboard during a join: that is expected
+    return null;
+  }
+}
+
+async function reloadOnceDashboardAnswers(): Promise<void> {
+  for (let attempt = 0; attempt < RELOAD_TRIES; attempt++) {
+    try {
+      const probe = await fetch('/healthz', { cache: 'no-store' });
+      if (probe.ok) {
+        window.location.reload();
+        return;
+      }
+    } catch {
+      // still restarting - try again in a moment
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  window.location.reload();
+}
+
+function watchJoinUntilDone(startedAt: number): void {
+  if (joinWatchTimer !== undefined) {
+    return;
+  }
+  let seenRunning = false;
+  let finishing = false;
+  joinWatchTimer = window.setInterval(async () => {
+    if (finishing) {
+      return;
+    }
+    const body = await readJoinUnitState();
+    if (body === null) {
+      return; // console unreachable: keep waiting, the unit is still running
+    }
+    if (isJoinUnitRunning(body)) {
+      seenRunning = true;
+      return;
+    }
+    // Before the unit exists the console still reports the PREVIOUS run's state, so "not
+    // running" is only believed once it has been seen running or a few seconds have passed.
+    if (!seenRunning && Date.now() - startedAt < JOIN_START_GRACE_MS) {
+      return;
+    }
+    finishing = true;
+    if (joinWatchTimer !== undefined) {
+      window.clearInterval(joinWatchTimer);
+      joinWatchTimer = undefined;
+    }
+    await reloadOnceDashboardAnswers();
+  }, 3000);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Small UI pieces                                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -440,7 +524,11 @@ function JoinNodePage() {
         }
         // If this node cannot read its own cluster-info any more, let the join proceed.
       }
+      const startedAt = Date.now();
       setJoinNotice(await startSelfJoin(decoded));
+      // Module-level on purpose: this component may be unmounted by Headlamp's own error screen
+      // long before the join ends, and the tab must still reload itself (user, 2026-11-12).
+      watchJoinUntilDone(startedAt);
       setPasted('');
     } catch (err: any) {
       setJoinError(String(err?.message ?? err));
@@ -514,7 +602,14 @@ function JoinNodePage() {
             sx={{ flex: 1, minWidth: 320 }}
           />
           <Button variant="contained" onClick={join} disabled={joining || !pasted.trim()}>
-            {joining ? 'Starting…' : 'Join this node'}
+            {joining ? (
+              <>
+                <CircularProgress size={14} sx={{ color: '#0b0b0b', mr: 1 }} />
+                Starting…
+              </>
+            ) : (
+              'Join this node'
+            )}
           </Button>
         </Box>
 
@@ -525,12 +620,32 @@ function JoinNodePage() {
         )}
 
         {joinNotice && (
-          <Typography variant="body2" sx={{ mt: 2 }}>
-            Join started on this node. {joinNotice}. Nothing was created in the cluster - the
-            join runs as a transient systemd unit on the host, so it finishes even though this
-            dashboard is about to disappear. Check on the control plane:{' '}
-            <Mono>kubectl get nodes</Mono>
-          </Typography>
+          // A full-screen notice, not a card inside the page: everything else on this page is
+          // about to become wrong (it reads the cluster being discarded), and the user asked for
+          // exactly two lines and nothing else on screen while the join runs.
+          <Box
+            sx={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 2500,
+              bgcolor: '#0b0b0b',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 2,
+              p: 4,
+              textAlign: 'center',
+            }}
+          >
+            <CircularProgress size={40} sx={{ color: '#c4ff2e' }} />
+            <Typography variant="body1" sx={{ fontWeight: 700, color: '#c4ff2e' }}>
+              Joining… do not close this tab
+            </Typography>
+            <Typography variant="body2" sx={{ color: '#c9cfc6', maxWidth: 540 }}>
+              {joinNotice}
+            </Typography>
+          </Box>
         )}
       </SectionBox>
     </>
