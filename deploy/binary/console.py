@@ -522,6 +522,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._nfs_post(parsed)
 
+    def do_DELETE(self) -> None:  # noqa: N802 - http.server naming
+        parsed = urlparse(self.path)
+        if parsed.path != "/etcd/snapshot":
+            self.send_error(404)
+            return
+        self._snapshot_delete(parse_qs(parsed.query))
+
     def do_POST(self) -> None:  # noqa: N802 - http.server naming
         path = urlparse(self.path).path
         if path == "/nfs":
@@ -529,6 +536,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/action/join":
             self._join_post()
+            return
+        if path == "/action/standalone":
+            self._standalone_post()
+            return
+        if path == "/etcd/snapshot":
+            self._snapshot_post()
             return
         if not path.startswith("/action/"):
             self.send_error(404)
@@ -600,6 +613,136 @@ class Handler(BaseHTTPRequestHandler):
                          "member": member,
                          "dashboard_kubeconfig": os.path.exists(self.DASHBOARD_KUBECONFIG)})
 
+    # ---- etcd snapshots ---------------------------------------------------
+    # WHY A HOST SERVICE AND NOT A PROVISIONER POD: a snapshot is the only thing that can
+    # rescue a broken cluster state, and on KubeOS a Pod cannot be relied on for it - the
+    # whole design keeps base Pods out, and a Pod cannot read the host's etcd PKI without
+    # being mounted into the host. etcdctl is already on the node (vendored with the control
+    # plane), so this is three lines of subprocess and nothing new to install.
+    SNAPSHOT_DIR = "/var/lib/kubeos/etcd-snapshots"
+    SNAPSHOT_PREFIX = "kubeos-etcd"
+    SNAPSHOT_MAX_BYTES = 1 << 30        # refuse to stream anything bigger than 1 GiB
+    ETCDCTL = "/usr/local/bin/etcdctl"
+    ETCD_PKI = "/etc/kubernetes/pki/etcd"
+    ETCD_ENDPOINT = "https://127.0.0.1:2379"
+    SNAPSHOT_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}\.db$")
+
+    def _snapshots_supported(self) -> bool:
+        """Only a control plane has an etcd to snapshot; a worker must say so, not pretend."""
+        return os.path.exists(os.path.join(self.ETCD_PKI, "server.crt")) and os.path.exists(self.ETCDCTL)
+
+    def _snapshot_names(self) -> list[str]:
+        try:
+            return sorted(entry for entry in os.listdir(self.SNAPSHOT_DIR)
+                          if entry.endswith(".db") and self.SNAPSHOT_NAME_RE.match(entry))
+        except OSError:
+            return []
+
+    def _snapshots_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        if not self._snapshots_supported():
+            self._json(409, {"ok": False, "supported": False,
+                             "error": "this machine is not a control plane, so it has no etcd to snapshot"})
+            return
+        entries = []
+        for name in self._snapshot_names():
+            full = os.path.join(self.SNAPSHOT_DIR, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            entries.append({"name": name, "bytes": stat.st_size, "modified": int(stat.st_mtime)})
+        self._json(200, {"ok": True, "supported": True, "directory": self.SNAPSHOT_DIR,
+                         "snapshots": entries})
+
+    def _snapshot_post(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        if not self._snapshots_supported():
+            self._json(409, {"ok": False, "supported": False,
+                             "error": "this machine is not a control plane, so it has no etcd to snapshot"})
+            return
+        name = "%s-%s.db" % (self.SNAPSHOT_PREFIX, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+        target = os.path.join(self.SNAPSHOT_DIR, name)
+        os.makedirs(self.SNAPSHOT_DIR, exist_ok=True)
+        try:
+            os.chmod(self.SNAPSHOT_DIR, 0o700)
+        except OSError:
+            pass
+        result = subprocess.run(
+            [self.ETCDCTL, "--endpoints", self.ETCD_ENDPOINT,
+             "--cacert", os.path.join(self.ETCD_PKI, "ca.crt"),
+             "--cert", os.path.join(self.ETCD_PKI, "server.crt"),
+             "--key", os.path.join(self.ETCD_PKI, "server.key"),
+             "snapshot", "save", target],
+            capture_output=True, text=True, timeout=120,
+            env={"ETCDCTL_API": "3", "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+        )
+        if result.returncode != 0:
+            log("etcd snapshot failed:\n" + (result.stderr or result.stdout or "")[-2000:])
+            # A half-written .db must not look like a backup.
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            self._json(500, {"ok": False, "error": (result.stderr or result.stdout or "etcdctl failed").strip()[-400:]})
+            return
+        try:
+            size = os.stat(target).st_size
+        except OSError:
+            size = 0
+        log(f"{self.client_address[0]} wrote a snapshot: {name} ({size} bytes)")
+        self._json(201, {"ok": True, "name": name, "bytes": size,
+                         "modified": int(time.time()), "directory": self.SNAPSHOT_DIR})
+
+    def _snapshot_download(self, query) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        name = (query.get("name") or [""])[0]
+        # No traversal, and only files this service created: the directory is root-owned 0700,
+        # but the name still comes from a URL.
+        if not self.SNAPSHOT_NAME_RE.match(name) or name not in self._snapshot_names():
+            self._json(404, {"ok": False, "error": "no such snapshot"})
+            return
+        full = os.path.join(self.SNAPSHOT_DIR, name)
+        try:
+            size = os.stat(full).st_size
+        except OSError:
+            self._json(404, {"ok": False, "error": "no such snapshot"})
+            return
+        if size > self.SNAPSHOT_MAX_BYTES:
+            self._json(413, {"ok": False, "error": "snapshot larger than 1 GiB - fetch it over ssh"})
+            return
+        log(f"{self.client_address[0]} downloading snapshot {name} ({size} bytes)")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(size))
+        self._cors()
+        self.end_headers()
+        with open(full, "rb") as handle:
+            shutil.copyfileobj(handle, self.wfile)
+
+    def _snapshot_delete(self, query) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        name = (query.get("name") or [""])[0]
+        if not self.SNAPSHOT_NAME_RE.match(name) or name not in self._snapshot_names():
+            self._json(404, {"ok": False, "error": "no such snapshot"})
+            return
+        try:
+            os.unlink(os.path.join(self.SNAPSHOT_DIR, name))
+        except OSError as reason:
+            self._json(500, {"ok": False, "error": f"could not delete {name}: {reason}"})
+            return
+        log(f"{self.client_address[0]} deleted snapshot {name}")
+        self._json(200, {"ok": True, "name": name})
+
     # ---- joining this node to a cluster -----------------------------------
     JOIN_UNIT = "kubeos-node-join"
     JOIN_HELPER = "/usr/bin/kubeos-node-join"
@@ -651,6 +794,61 @@ class Handler(BaseHTTPRequestHandler):
         self._json(202, {"ok": True, "unit": self.JOIN_UNIT,
                          "detail": "the node is joining; this dashboard goes away when its own "
                                    "cluster is reset and comes back when the node is Ready"})
+
+    # ---- becoming a standalone node again ----------------------------------
+    # Fired by the dashboard gateway when this machine has been REMOVED from its cluster (see
+    # kubeos-node-standalone and authproxy's membership probe). A transient unit for the same
+    # reason as the join: the work stops kubelet and starts the node's own control plane, which
+    # takes this dashboard down and back up again.
+    STANDALONE_UNIT = "kubeos-node-standalone"
+    STANDALONE_HELPER = "/usr/bin/kubeos-node-standalone"
+
+    def _standalone_post(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        if not os.path.exists(self.STANDALONE_HELPER):
+            self._json(500, {"ok": False,
+                             "error": f"{self.STANDALONE_HELPER} is missing - this node's image has no standalone helper"})
+            return
+        subprocess.run(["/usr/bin/systemctl", "reset-failed", self.STANDALONE_UNIT],
+                       capture_output=True, text=True, timeout=15)
+        result = subprocess.run(
+            ["/usr/bin/systemd-run", "--unit", self.STANDALONE_UNIT, "--no-block",
+             "--description=KubeOS: make this node a standalone node again",
+             self.STANDALONE_HELPER],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            self._json(500, {"ok": False,
+                             "error": (result.stderr or result.stdout or "systemd-run failed").strip()})
+            return
+        log(f"{self.client_address[0]} started the standalone bring-up as unit {self.STANDALONE_UNIT}")
+        self._json(202, {"ok": True, "unit": self.STANDALONE_UNIT,
+                         "detail": "this machine is rebuilding its own one-node cluster; its dashboard "
+                                   "comes back when that is done"})
+
+    def _standalone_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        active = subprocess.run(["/usr/bin/systemctl", "is-active", self.STANDALONE_UNIT],
+                                capture_output=True, text=True, timeout=10)
+        state = (active.stdout or "").strip() or "unknown"
+        shown = subprocess.run(
+            ["/usr/bin/systemctl", "show", self.STANDALONE_UNIT, "-p", "Result",
+             "-p", "ActiveEnterTimestamp", "--value"],
+            capture_output=True, text=True, timeout=10,
+        )
+        values = (shown.stdout or "").splitlines()
+        journal = subprocess.run(
+            ["/usr/bin/journalctl", "-u", self.STANDALONE_UNIT, "-n", "1", "--no-pager", "-o", "cat"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self._json(200, {"ok": True, "unit": self.STANDALONE_UNIT, "state": state,
+                         "result": values[0] if values else "",
+                         "entered": values[1] if len(values) > 1 else "",
+                         "last_log_line": (journal.stdout or "").strip()[-300:]})
 
     def _join_get(self) -> None:
         if not self._action_allowed():
@@ -707,8 +905,17 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/action/join":
             self._join_get()
             return
+        if parsed.path == "/action/standalone":
+            self._standalone_get()
+            return
         if parsed.path == "/node":
             self._node_get()
+            return
+        if parsed.path == "/etcd/snapshots":
+            self._snapshots_get()
+            return
+        if parsed.path == "/etcd/snapshot":
+            self._snapshot_download(parse_qs(parsed.query))
             return
         if parsed.path != "/ws":
             self.send_error(404)
