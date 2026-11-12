@@ -572,7 +572,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"ok": False, "error": "bad token"})
             return
         length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > 8192:
+        # 32 KiB: the join string now also carries the joining node's dashboard kubeconfig
+        # (a service-account token plus the cluster CA), which is a few KiB on its own.
+        if length <= 0 or length > 32768:
             self._json(400, {"ok": False, "error": "expected a small JSON body"})
             return
         try:

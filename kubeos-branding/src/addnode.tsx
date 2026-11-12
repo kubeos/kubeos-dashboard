@@ -44,6 +44,13 @@ interface JoinBundle {
   token: string;
   caHash: string;
   controlPlane?: string;
+  /**
+   * A kubeconfig for THIS dashboard, as `kubeos-dashboard` on the control plane. The joining
+   * node runs `install.sh` with it after the join, so its dashboard points at the joined
+   * cluster instead of the one `kubeadm reset` deleted - otherwise the browser shows
+   * "Failed to get authentication information" (user hit exactly that, twice, 2026-11-12).
+   */
+  kubeconfig?: string;
 }
 
 function encodeJoin(bundle: JoinBundle): string {
@@ -140,6 +147,8 @@ async function certificateHash(caDataBase64: string): Promise<string> {
 interface ClusterInfo {
   endpoint: string;
   caHash: string;
+  /** base64 CA from cluster-info: what a handover kubeconfig must trust. */
+  caData?: string;
 }
 
 async function readClusterInfo(): Promise<ClusterInfo> {
@@ -152,7 +161,11 @@ async function readClusterInfo(): Promise<ClusterInfo> {
   if (!rawEndpoint || !caData) {
     throw new Error('cluster-info has no server address or CA certificate');
   }
-  return { endpoint: rawEndpoint.replace(/^https?:\/\//, ''), caHash: await certificateHash(caData) };
+  return {
+    endpoint: rawEndpoint.replace(/^https?:\/\//, ''),
+    caHash: await certificateHash(caData),
+    caData,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -195,6 +208,103 @@ async function createBootstrapToken(): Promise<string> {
     },
   });
   return `${id}.${secret}`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The joining node's own dashboard identity (a service account, not a Pod)    */
+/* -------------------------------------------------------------------------- */
+
+const DASHBOARD_SA = 'kubeos-dashboard';
+const DASHBOARD_CRB = 'kubeos:dashboard-join';
+
+/**
+ * Mint a kubeconfig for the joining node's dashboard and hand it over inside the join string.
+ *
+ * WHY: after `kubeadm reset` the joining node's dashboard has no cluster to talk to, so it
+ * shows "Failed to get authentication information". The node cannot invent cluster access by
+ * itself - a worker only holds a kubelet identity - so the control plane has to give it one.
+ * A ServiceAccount + ClusterRoleBinding + token Secret is the least machinery that works, it
+ * needs no certificate authority, and it is exactly as privileged as the dashboard's own
+ * kubeconfig already is (Headlamp shows everything). Nothing is created by a *button click on
+ * the joining node*; this runs on the control plane whose dashboard is doing the joining.
+ */
+async function dashboardKubeconfig(endpoint: string, caData: string): Promise<string> {
+  const ignoreExists = async (run: () => Promise<unknown>) => {
+    try {
+      await run();
+    } catch (err: any) {
+      const message = String(err?.message ?? err);
+      if (!message.includes('409') && !message.toLowerCase().includes('already exists')) {
+        throw new Error(`could not prepare the dashboard identity: ${message}`);
+      }
+    }
+  };
+
+  await ignoreExists(() =>
+    ApiProxy.post(`/api/v1/namespaces/${NAMESPACE}/serviceaccounts`, {
+      apiVersion: 'v1',
+      kind: 'ServiceAccount',
+      metadata: { name: DASHBOARD_SA, namespace: NAMESPACE, labels: { 'kubeos.io/join': 'dashboard' } },
+    })
+  );
+  await ignoreExists(() =>
+    ApiProxy.post('/apis/rbac.authorization.k8s.io/v1/clusterrolebindings', {
+      apiVersion: 'rbac.authorization.k8s.io/v1',
+      kind: 'ClusterRoleBinding',
+      metadata: { name: DASHBOARD_CRB, labels: { 'kubeos.io/join': 'dashboard' } },
+      roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: 'cluster-admin' },
+      subjects: [{ kind: 'ServiceAccount', name: DASHBOARD_SA, namespace: NAMESPACE }],
+    })
+  );
+  const secretName = `${DASHBOARD_SA}-token`;
+  await ignoreExists(() =>
+    ApiProxy.post(`/api/v1/namespaces/${NAMESPACE}/secrets`, {
+      apiVersion: 'v1',
+      kind: 'Secret',
+      metadata: {
+        name: secretName,
+        namespace: NAMESPACE,
+        labels: { 'kubeos.io/join': 'dashboard' },
+        annotations: { 'kubernetes.io/service-account.name': DASHBOARD_SA },
+      },
+      type: 'kubernetes.io/service-account-token',
+    })
+  );
+
+  // The token controller fills `data.token` a moment after the Secret exists.
+  let token = '';
+  for (let attempt = 0; attempt < 20 && !token; attempt++) {
+    const answer: any = await ApiProxy.request(
+      `/api/v1/namespaces/${NAMESPACE}/secrets/${secretName}`
+    );
+    const secret = answer?.json ?? answer;
+    token = secret?.data?.token ? atob(String(secret.data.token)) : '';
+    if (!token) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+  if (!token) {
+    throw new Error('the cluster did not issue a dashboard token within 10 seconds');
+  }
+
+  return `apiVersion: v1
+kind: Config
+clusters:
+- name: kubeos
+  cluster:
+    server: https://${endpoint}
+    certificate-authority-data: ${caData}
+users:
+- name: ${DASHBOARD_SA}
+  user:
+    token: ${token}
+contexts:
+- name: main
+  context:
+    cluster: kubeos
+    user: ${DASHBOARD_SA}
+current-context: main
+`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -284,8 +394,21 @@ function JoinNodePage() {
     setGenerateError(null);
     try {
       const info = bundle ?? (await readClusterInfo());
-      const token = await createBootstrapToken();
-      const value = encodeJoin({ ...info, token });
+      const bootstrap = await createBootstrapToken();
+      // The kubeconfig is best effort: without it the join still works and the node's
+      // dashboard can be re-pointed by hand; with it, the join finishes with the dashboard
+      // already correct.
+      let handover = '';
+      try {
+        if (info.caData) {
+          handover = await dashboardKubeconfig(info.endpoint, info.caData);
+        }
+      } catch (err: any) {
+        setGenerateError(`join string generated, but the dashboard handover failed: ${String(
+          err?.message ?? err
+        )}`);
+      }
+      const value = encodeJoin({ ...info, token: bootstrap, kubeconfig: handover });
       setGenerated(value);
       setBundle(info);
     } catch (err: any) {

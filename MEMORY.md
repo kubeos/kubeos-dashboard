@@ -1713,6 +1713,21 @@ replaces the cluster-wide token with that node's and breaks the first node's bro
 token file to node 2 before installing; the code change is for `install.sh` to adopt the token **from the Secret** when
 its local file is absent (not yet written).
 
+**A join now ends with the joining node's dashboard already correct (2026-11-12 16:20).** The "Failed to get
+authentication information" page was never a login bug: after `kubeadm reset` the node's dashboard pointed at the
+cluster that had just been deleted, and a worker holds only a kubelet identity, so it cannot fix itself. The control
+plane now hands the credential over **inside the join string**: `dashboardKubeconfig()` creates the
+`kubeos-system/kubeos-dashboard` ServiceAccount + a `cluster-admin` ClusterRoleBinding + a service-account token Secret,
+waits up to 10 s for the token controller to fill it, and builds a kubeconfig with context `main` (so URLs stay
+`/c/main/...`) that `KOSJOIN1.…` carries in a new `kubeconfig` field. `cluster-info`'s `certificate-authority-data`
+also travels in `ClusterInfo` now. On the ISO side `kubeos-node-join` decodes that field to
+`/run/kubeos-join-dashboard.conf` and, after the node is Ready, `adopt_dashboard()` installs it as the dashboard's
+kubeconfig (using the image's `install.sh` when a future ISO ships one, otherwise a plain copy) and restarts
+`kubeos-dashboard`/`kubeos-dashboard-auth`. console.py's join body limit went 8 KiB → 32 KiB because the bundle is now
+~3.8 KB. Verified: the SA kubeconfig reads the cluster (`kubectl get nodes`, `can-i list pods -A` = yes), the decoder
+writes the file from a real bundle, and on kubeos2 a deliberately dead kubeconfig (`https://127.0.0.1:6443`) was
+replaced with `https://192.168.122.5:6443`, units restarted, dashboard answering. Release `df02339f…`.
+
 **A "one value per cluster" Secret must be adopt-or-create, never apply (2026-11-12 15:58).** The CA Secret used
 `kubectl apply`, so the last node to install replaced the cluster's CA with its own — two CAs with the *same subject*
 (`O=KubeOS, CN=KubeOS Cluster CA`), each leaf verifying locally and failing on the other node. Strict TLS caught it
