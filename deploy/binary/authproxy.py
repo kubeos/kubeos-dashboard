@@ -37,6 +37,7 @@ import ctypes
 import ctypes.util
 import grp
 import hashlib
+import html
 import hmac
 import http.client
 import json
@@ -56,7 +57,14 @@ from urllib.parse import parse_qs, urlparse
 SHADOW = "/etc/shadow"
 SESSION_COOKIE = "kubeos_session"
 FAIL_WINDOW = 300.0          # seconds a failed attempt is remembered
-FAIL_LIMIT = 5               # attempts per address inside the window
+FAIL_LIMIT = 5               # wrong passwords per address before the answer is 429
+FAIL_HARD_LIMIT = 50         # above this we stop verifying passwords at all (CPU guard)
+MAX_BODY = 32 << 20          # a proxied request body above this is refused with 413
+# A client may not speak for itself: the gateway sets the client identity/protocol it forwards,
+# so any inbound copy has to go first. Compared lower-cased, which is what makes a lowercase
+# `x-forwarded-for:` disappear as well (it used to survive and sit next to the trusted one).
+CLIENT_SUPPLIED = {"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-real-ip",
+                   "forwarded"}
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
     "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -1091,6 +1099,10 @@ class Membership:
 class Gateway(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "kubeos-auth"
+    # ThreadingHTTPServer starts a thread per connection, so a socket that is opened and then
+    # dribbled must not be held for ever: this is the only port that answers with the login
+    # page, and a slowloris there would keep the operator out of their own node.
+    timeout = 30
 
     membership: Membership
     console_port: int = 30444
@@ -1153,8 +1165,14 @@ class Gateway(BaseHTTPRequestHandler):
                     '(on the node: <code>kubeos-trust-ca</code> prints the exact steps).')
         else:
             cert = "Certificate: this node serves a self-signed certificate (no cluster CA)."
-        return (LOGIN_PAGE.replace("__HOST__", self.hostname)
-                .replace("__USER__", user).replace("__ERROR__", error)
+        # user/error come from the posted form, so escaping them is what stops this page from
+        # reflecting markup. Measured 2026-11-13 before the fix: `user=" autofocus
+        # onfocus="alert(1)` produced a live event-handler attribute and
+        # `user="><script>alert(1)</script>` was echoed verbatim - one form post away from
+        # script running as the signed-in cluster admin, on this origin.
+        return (LOGIN_PAGE.replace("__HOST__", html.escape(self.hostname, quote=True))
+                .replace("__USER__", html.escape(user, quote=True))
+                .replace("__ERROR__", html.escape(error))
                 .replace("__CERT__", cert)).encode()
 
     def _standalone_page(self) -> bytes:
@@ -1403,17 +1421,26 @@ class Gateway(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 
-    def _rate_limited(self) -> bool:
+    def _failure_count(self) -> int:
+        """Wrong passwords from this address inside the window (prunes while it counts)."""
         now = time.time()
         address = self.client_address[0]
         with self.failures_lock:
             hits = [t for t in self.failures.get(address, []) if now - t < FAIL_WINDOW]
-            self.failures[address] = hits
-            return len(hits) >= FAIL_LIMIT
+            if hits:
+                self.failures[address] = hits
+            else:
+                # Do not keep an address (personal data) for a client that stopped trying.
+                self.failures.pop(address, None)
+            return len(hits)
 
     def _record_failure(self) -> None:
         with self.failures_lock:
             self.failures.setdefault(self.client_address[0], []).append(time.time())
+
+    def _clear_failures(self) -> None:
+        with self.failures_lock:
+            self.failures.pop(self.client_address[0], None)
 
     # -- login / logout ----------------------------------------------------------
     def _handle_login(self) -> None:
@@ -1424,16 +1451,28 @@ class Gateway(BaseHTTPRequestHandler):
         fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         user = (fields.get("user") or [""])[0].strip()
         password = (fields.get("password") or [""])[0]
-        if self._rate_limited():
-            log(f"{self.client_address[0]} refused: too many failed logins")
+        # THE RATE LIMIT MUST NEVER REFUSE THE CORRECT PASSWORD. It used to run before the
+        # password was verified, so five wrong guesses from one address locked the real admin
+        # out for five minutes - and any stranger who could reach :30443 could do that on
+        # demand (measured 2026-11-13: five 401s, then 429 - including for the correct
+        # password). Now 429 answers WRONG passwords only, and a hard cap stops the password
+        # check itself from being used as a CPU lever.
+        failures = self._failure_count()
+        if failures >= FAIL_HARD_LIMIT:
+            log(f"{self.client_address[0]} refused: {failures} failed logins, not verifying")
             self._send(429, self._login_page("Too many attempts - wait a few minutes."),
                        extra=[("Retry-After", "300")])
             return
         if not password_ok(user, password):
             self._record_failure()
             log(f"{self.client_address[0]} refused: bad password for {user or '(no user)'}")
-            self._send(401, self._login_page("Wrong user or password.", user=user or "root"))
+            if failures + 1 >= FAIL_LIMIT:
+                self._send(429, self._login_page("Too many attempts - wait a few minutes."),
+                           extra=[("Retry-After", "300")])
+            else:
+                self._send(401, self._login_page("Wrong user or password.", user=user or "root"))
             return
+        self._clear_failures()
         cookie = (f"{SESSION_COOKIE}={self.sessions.issue(user)}; Path=/; HttpOnly; Secure; "
                   f"SameSite=Strict; Max-Age={int(self.sessions.ttl)}")
         log(f"{self.client_address[0]} signed in as {user}")
@@ -1465,7 +1504,15 @@ class Gateway(BaseHTTPRequestHandler):
 
     def _proxy(self) -> None:
         body = None
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, b"bad Content-Length\n", content_type="text/plain; charset=utf-8")
+            return
+        if length > MAX_BODY:
+            self._send(413, b"request body too large\n",
+                       content_type="text/plain; charset=utf-8")
+            return
         if length > 0:
             body = self.rfile.read(length)
 
@@ -1473,7 +1520,8 @@ class Gateway(BaseHTTPRequestHandler):
             self._proxy_websocket()
             return
 
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_SUPPLIED}
         headers["Host"] = f"127.0.0.1:{self.upstream_port}"
         headers["X-Forwarded-For"] = self.client_address[0]
         headers["X-Forwarded-Proto"] = "https"
@@ -1664,8 +1712,9 @@ class Gateway(BaseHTTPRequestHandler):
             wants_html = "text/html" in (self.headers.get("Accept") or "") or path == "/"
             if self.command in ("GET", "HEAD") and wants_html:
                 step = join_detail or "waiting for the join to finish"
-                self._send(200, (JOINING_PAGE.replace("__HOST__", self.hostname)
-                                 .replace("__STEP__", step)).encode())
+                # journal-derived text: escaped for the same reason as the login page
+                self._send(200, (JOINING_PAGE.replace("__HOST__", html.escape(self.hostname, quote=True))
+                                 .replace("__STEP__", html.escape(step))).encode())
             else:
                 self._send_json(503, {"state": "joining",
                                       "error": "this machine is joining a cluster",
