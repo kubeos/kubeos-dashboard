@@ -709,17 +709,19 @@ class Handler(BaseHTTPRequestHandler):
         ok, kind = self._lvm_run(["/usr/bin/lsblk", "-ndo", "TYPE", device])
         if not ok or kind.strip() != "disk":
             return f"{device} is not a whole disk (lsblk says {kind.strip() or 'nothing'})", 400
+        ok, mounted = self._lvm_run(["/usr/bin/findmnt", "-rn", "-S", device])
+        if ok and mounted.strip():
+            return f"{device} is mounted: {mounted.strip().splitlines()[0]}", 400
+        # "already in a volume group" before the partition test: a disk that is already a PV also
+        # lists its thin pools as children, and "belongs to kbstest" is the useful answer.
+        ok, group = self._lvm_run(["/usr/sbin/pvs", "--noheadings", "-o", "vg_name", device])
+        if ok and group.strip():
+            return f"{device} already belongs to volume group {group.strip()}", 400
         # A disk with partitions on it is in use, whatever it holds: refuse before pvcreate
         # gets a chance to write anything (lsblk lists the disk itself first, then its children).
         ok, children = self._lvm_run(["/usr/bin/lsblk", "-rno", "NAME", device])
         if ok and len(children.strip().splitlines()) > 1:
             return f"{device} has partitions on it; refusing to overwrite it", 400
-        ok, mounted = self._lvm_run(["/usr/bin/findmnt", "-rn", "-S", device])
-        if ok and mounted.strip():
-            return f"{device} is mounted: {mounted.strip().splitlines()[0]}", 400
-        ok, group = self._lvm_run(["/usr/sbin/pvs", "--noheadings", "-o", "vg_name", device])
-        if ok and group.strip():
-            return f"{device} already belongs to volume group {group.strip()}", 400
         ok, output = self._lvm_run(["/usr/sbin/pvcreate", "-ff", "-y", device])
         if not ok:
             return f"pvcreate failed: {output}", 500
