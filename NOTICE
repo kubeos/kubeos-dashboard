@@ -9,5 +9,9 @@ sponsored by the Cloud Native Computing Foundation, the Kubernetes project, or t
 Headlamp maintainers. The name "KubeOS" and the KubeOS marks identify this
 distribution only.
 
-The unmodified Headlamp container image is used as the base of the image built from
-image/Dockerfile; the KubeOS theme and logo are supplied as a Headlamp plugin.
+This release redistributes the unmodified Headlamp server binary and frontend (the
+layer contents of the upstream container image, vendored in vendor/headlamp/ and
+verified by digest at build time). Headlamp's own licence notice ships next to this
+file as LICENSE.headlamp. Everything KubeOS adds - the login gateway, the host
+console, the installer, the trust helper and the kubeos-branding plugin (theme, logo
+and pages) - is this project's own work under the same Apache License 2.0.

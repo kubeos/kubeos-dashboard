@@ -144,7 +144,7 @@ done
 [ -f "$KUBECONFIG_SRC" ] || die "no such file: $KUBECONFIG_SRC"
 [ -x "$SRC/bin/headlamp-server" ] || die "incomplete release: $SRC/bin/headlamp-server is missing"
 [ -s "$SRC/share/frontend/index.html" ] || die "incomplete release: $SRC/share/frontend/index.html is missing"
-[ -s "$SRC/share/plugins/kubeos-branding/main.js" ] || die "incomplete release: the KubeOS plugin bundle is missing"
+[ -s "$SRC/share/plugins/kubeos/main.js" ] || die "incomplete release: the KubeOS plugin bundle is missing"
 
 # ---- user ----------------------------------------------------------------
 if ! id "$RUN_USER" >/dev/null 2>&1; then
@@ -171,6 +171,18 @@ log "installed the binary, the frontend and the plugin"
 # upstream release, which the release tarball guarantees. The VERSION file is kept
 # next to the binary so an operator can see what is installed.
 [ -f "$SRC/VERSION" ] && install -m 0644 "$SRC/VERSION" "$BIN_DIR/VERSION"
+# The licences must reach whoever receives this software, not just whoever unpacks the
+# tarball: Apache-2.0 asks for the notice to accompany the distribution, and upstream
+# Headlamp's own notice travels with the binary we redistribute.
+DOC_DIR=/usr/share/doc/kubeos-dashboard
+install -d -m 0755 "$DOC_DIR"
+for doc in LICENSE NOTICE LICENSE.headlamp; do
+    if [ -f "$SRC/$doc" ]; then
+        install -m 0644 "$SRC/$doc" "$DOC_DIR/$doc"
+    else
+        log "WARNING: $doc is missing from the release - tell the maintainer"
+    fi
+done
 
 install -m 0600 -o "$RUN_USER" -g "$RUN_USER" "$KUBECONFIG_SRC" "$CONF_DIR/kubeconfig"
 log "kubeconfig installed as $CONF_DIR/kubeconfig (the identity the dashboard uses for everyone)"

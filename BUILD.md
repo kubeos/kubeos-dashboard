@@ -98,10 +98,10 @@ build-binary:   sha256: <64 hex chars>
 Result: `release/kubeos-dashboard-0.1.0-linux-amd64.tar.gz` — 50 MB compressed, 122 MB unpacked,
 830 files.
 
-**Only if you changed the TypeScript** (`kubeos-branding/src/*`) rebuild the plugin bundle first:
+**Only if you changed the TypeScript** (`kubeos/src/*`) rebuild the plugin bundle first:
 
 ```sh
-cd kubeos-branding && npm install && npm run build && cd -
+cd kubeos && npm install && npm run build && cd -
 deploy/binary/build-binary.sh
 ```
 
@@ -113,7 +113,7 @@ than the committed bundle, which is the mistake that ships a stale UI.
 ```
 bin/headlamp-server                 static Go binary, 93 MB, no libc
 share/frontend/                     the built UI
-share/plugins/kubeos-branding/      the KubeOS plugin (branding, NFS, disks, join, node controls)
+share/plugins/kubeos/      the KubeOS plugin (branding, NFS, disks, join, node controls)
 systemd/kubeos-dashboard.service    the unit
 systemd/kubeos-dashboard.env.example
 install.sh  uninstall.sh            root-only, idempotent

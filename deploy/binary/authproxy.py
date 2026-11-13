@@ -710,6 +710,147 @@ def host_health(membership_state: str, membership_detail: str) -> dict:
 
 # --------------------------------------------------------------------------- membership
 KUBECTL = "/usr/bin/kubectl"
+
+# Kubernetes decides a pod's node ONCE, when the pod is created, and no default component ever
+# revisits that decision: remove a node and its pods are replaced elsewhere (that part works),
+# but add a node back and the running pods stay where they are - the cluster ends up with two
+# nodes full and two empty, and `topologySpreadConstraints` never gets a say because it is only
+# consulted while scheduling a NEW pod. KubeOS therefore offers one deliberate action that asks
+# each workload's own controller to replace its pods, which is the only thing that moves them.
+# It creates no Pod itself: the Deployment/StatefulSet does, exactly as when a node is removed.
+REBALANCE_ANNOTATION = "kubeos.io/rebalanced-at"
+
+# ---------------------------------------------------------------------------- the SPA watchdog
+# Headlamp's own loading state is a black screen with three dots, and when the CLUSTER API cannot
+# be reached (this node's kubeconfig points at an API server that is asleep, restarting, or was
+# never there) it stays on that screen for ever: no message, no retry, nothing to click (user,
+# 2026-11-13: "when i refresh it comes in whole screen sometimes it coming automatically").
+# The gateway already knows whether that API answers - it is what the membership probe asks - so
+# every HTML page it proxies gets this small script: it watches /kubeos-cluster-health, explains
+# the wait in KubeOS's own words, and reloads the page by itself once the API is back.
+WATCH_SNIPPET = b'<script src="/kubeos-watch.js" defer></script>'
+WATCH_JS = b"""/* KubeOS dashboard watchdog: says why the screen is empty, and reloads when it is not. */
+(function () {
+  var failures = 0;
+  var card = null;
+  var busy = false;
+
+  function build() {
+    var wrap = document.createElement('div');
+    wrap.setAttribute('data-kubeos-watch', 'overlay');
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#0b0b0b;' +
+      'display:flex;align-items:center;justify-content:center;' +
+      'font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
+    var box = document.createElement('div');
+    box.style.cssText = 'width:min(92vw,540px);background:#111312;border:1px solid rgba(196,255,46,.25);' +
+      'border-radius:10px;padding:26px;text-align:center;color:#e8e8e8;';
+    var brand = document.createElement('div');
+    brand.style.cssText = 'margin-bottom:18px;color:#c4ff2e;letter-spacing:.14em;font-size:15px;font-weight:700;';
+    brand.textContent = 'KUBEOS';
+    var spinner = document.createElement('div');
+    spinner.style.cssText = 'width:46px;height:46px;margin:6px auto 18px;border-radius:50%;' +
+      'border:4px solid rgba(196,255,46,.18);border-top-color:#c4ff2e;animation:kubeosspin 900ms linear infinite;';
+    var style = document.createElement('style');
+    style.textContent = '@keyframes kubeosspin{to{transform:rotate(360deg)}}';
+    var title = document.createElement('div');
+    title.style.cssText = 'font-size:16px;margin:0 0 10px;';
+    title.textContent = 'Waiting for the cluster';
+    var detail = document.createElement('div');
+    detail.setAttribute('data-kubeos-watch', 'detail');
+    detail.style.cssText = 'color:#c9cfc6;margin:8px 0;';
+    var note = document.createElement('div');
+    note.style.cssText = 'margin-top:16px;color:#8b968a;font-size:12px;border-top:1px solid #1d211c;padding-top:12px;';
+    note.textContent = 'This page reloads by itself as soon as the cluster answers again. ' +
+      'Nothing is broken and there is nothing to do.';
+    box.appendChild(brand); box.appendChild(spinner); box.appendChild(title);
+    box.appendChild(detail); box.appendChild(note);
+    wrap.appendChild(box); wrap.appendChild(style);
+    return wrap;
+  }
+
+  function show(detail) {
+    if (!card) {
+      card = build();
+      document.body.appendChild(card);
+    }
+    var line = card.querySelector('[data-kubeos-watch="detail"]');
+    if (line && detail) { line.textContent = detail; }
+  }
+
+  function check() {
+    if (busy) { return; }
+    busy = true;
+    fetch('/kubeos-cluster-health', { cache: 'no-store' })
+      .then(function (answer) { return answer.json(); })
+      .then(function (body) {
+        if (body && body.api_reachable) {
+          failures = 0;
+          if (card) { window.location.reload(); }
+          return;
+        }
+        failures += 1;
+        if (failures >= 2) {
+          show((body && body.detail) || 'the cluster API is not answering');
+        }
+      })
+      .catch(function () {
+        failures += 1;
+        if (failures >= 2) { show("this node's dashboard is not answering yet"); }
+      })
+      .then(function () { busy = false; });
+  }
+
+  window.setInterval(check, 3000);
+  check();
+}());
+"""
+
+
+
+def kubectl_run(kubeconfig: str, *args: str, timeout: int = 30) -> tuple[bool, str]:
+    """Run kubectl for its exit code only (delete/patch answer in prose, not JSON)."""
+    if not kubeconfig or not os.path.exists(kubeconfig):
+        return False, f"no kubeconfig at {kubeconfig or '(none)'}"
+    if not os.path.exists(KUBECTL):
+        return False, f"{KUBECTL} is not installed"
+    try:
+        done = subprocess.run(
+            [KUBECTL, "--kubeconfig", kubeconfig, *args,
+             "--cache-dir", "/tmp/kubeos-auth-cache"],
+            capture_output=True, text=True, timeout=timeout,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+    except (OSError, subprocess.TimeoutExpired) as reason:
+        return False, f"could not run kubectl ({reason})"
+    if done.returncode != 0:
+        return False, (done.stderr or done.stdout or "kubectl failed").strip()[:300]
+    return True, (done.stdout or "").strip()[:300]
+
+
+def kubectl_json(kubeconfig: str, *args: str, timeout: int = 20) -> tuple[bool, object, str]:
+    """Run a read-only kubectl call and parse its JSON.
+
+    HOME/--cache-dir are outside /root because the gateway unit runs with ProtectHome=yes and
+    ProtectSystem=strict (same reason the membership probe does it).
+    """
+    if not kubeconfig or not os.path.exists(kubeconfig):
+        return False, None, f"no kubeconfig at {kubeconfig or '(none)'}"
+    if not os.path.exists(KUBECTL):
+        return False, None, f"{KUBECTL} is not installed"
+    try:
+        done = subprocess.run(
+            [KUBECTL, "--kubeconfig", kubeconfig, *args,
+             "--cache-dir", "/tmp/kubeos-auth-cache"],
+            capture_output=True, text=True, timeout=timeout,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+    except (OSError, subprocess.TimeoutExpired) as reason:
+        return False, None, f"could not run kubectl ({reason})"
+    if done.returncode != 0:
+        return False, None, (done.stderr or done.stdout or "kubectl failed").strip()[:300]
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError as reason:
+        return False, None, f"kubectl answered something that is not JSON ({reason})"
+
 DEFAULT_KUBECONFIG = "/etc/kubeos-dashboard/kubeconfig"
 
 
@@ -1058,6 +1199,164 @@ class Gateway(BaseHTTPRequestHandler):
         connection.close()
         self._send(status, payload, content_type="application/json; charset=utf-8")
 
+    # -- rebalancing workloads onto the nodes that have room ------------------
+    def _rebalance_plan(self) -> tuple[list, list, int, str]:
+        """Compute, per workload, which pods sit on an over-full node.
+
+        WHY NOT `rollout restart`: measured on a 4-node cluster (2026-11-13), a rolling update
+        replaces pods while the old ones still exist, so the scheduler keeps seeing the crowded
+        nodes as busy and the workload ends up wherever it happened to fit - 1/2/1/0 instead of
+        1/1/1/1. Deleting ONLY the surplus pods is what moves them: the controller recreates them
+        while the crowded node's pod is gone, the scheduler's spread rules then get a say, and the
+        rest of the workload keeps running untouched.
+        """
+        conf = self.membership.kubeconfig
+        ok, nodes, error = kubectl_json(conf, "get", "nodes", "-o", "json")
+        if not ok:
+            raise RuntimeError(f"cannot list the nodes: {error}")
+        ok, pods, error = kubectl_json(conf, "get", "pods", "-A", "-o", "json")
+        if not ok:
+            raise RuntimeError(f"cannot list the pods: {error}")
+
+        eligible = []
+        for item in nodes.get("items", []):
+            meta = item.get("metadata") or {}
+            spec = item.get("spec") or {}
+            status = item.get("status") or {}
+            ready = any(cond.get("type") == "Ready" and cond.get("status") == "True"
+                        for cond in (status.get("conditions") or []))
+            taints = [t.get("effect") for t in (spec.get("taints") or [])]
+            if ready and not spec.get("unschedulable") and not (
+                    {"NoSchedule", "NoExecute"} & set(taints)):
+                eligible.append(meta.get("name") or "")
+        eligible = [name for name in eligible if name]
+
+        bare = 0
+        pods_by_owner: dict = {}
+        for pod in pods.get("items", []):
+            status = pod.get("status") or {}
+            if (status.get("phase") or "") in ("Succeeded", "Failed"):
+                continue
+            owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+            if not owners:
+                bare += 1
+                continue
+            if pod.get("metadata", {}).get("deletionTimestamp"):
+                continue
+            # A Deployment's pods are owned by its ReplicaSet, so walk one level up.
+            owner = owners[0]
+            key = (owner.get("kind") or "", owner.get("name") or "", pod["metadata"].get("namespace") or "default")
+            pods_by_owner.setdefault(key, []).append(pod)
+
+        # ReplicaSet -> Deployment, so the plan can talk about workloads the user recognises.
+        rs_to_deploy: dict = {}
+        ok, sets, _ = kubectl_json(conf, "get", "replicasets", "-A", "-o", "json")
+        if ok:
+            for item in sets.get("items", []):
+                meta = item.get("metadata") or {}
+                for owner in (meta.get("ownerReferences") or []):
+                    if owner.get("kind") == "Deployment":
+                        rs_to_deploy[(meta.get("namespace") or "default", meta.get("name") or "")] = owner.get("name") or ""
+
+        workloads, plan = [], []
+        for resource, kind in (("deployments", "Deployment"), ("statefulsets", "StatefulSet")):
+            ok, listing, _ = kubectl_json(conf, "get", resource, "-A", "-o", "json")
+            if not ok:
+                continue
+            for item in listing.get("items", []):
+                meta = item.get("metadata") or {}
+                spec = item.get("spec") or {}
+                status = item.get("status") or {}
+                replicas = int(spec.get("replicas") or 0)
+                if replicas <= 0:
+                    continue
+                namespace = meta.get("namespace") or "default"
+                name = meta.get("name") or ""
+                owned = pods_by_owner.get((kind, name, namespace), [])
+                if kind == "Deployment":
+                    owned = []
+                    for (owner_kind, owner_name, owner_ns), owned_pods in pods_by_owner.items():
+                        if owner_kind == "ReplicaSet" and owner_ns == namespace and \
+                                rs_to_deploy.get((namespace, owner_name)) == name:
+                            owned.extend(owned_pods)
+                placement: dict = {}
+                for pod in owned:
+                    node = (pod.get("spec") or {}).get("nodeName") or ""
+                    if node:
+                        placement[node] = placement.get(node, 0) + 1
+                # Target: as even as possible over the nodes that can take pods.
+                targets: dict = {}
+                if eligible:
+                    base, extra = divmod(replicas, len(eligible))
+                    ordered = sorted(eligible, key=lambda n: (-placement.get(n, 0), n))
+                    for index, node in enumerate(ordered):
+                        targets[node] = base + (1 if index < extra else 0)
+                # Keep up to `allowed` pods where they are and move the rest; documents what the
+                # user sees in the preview ("2 pods will move off kubeos1").
+                moves = []
+                for node, count in placement.items():
+                    allowed = targets.get(node, count)
+                    if count <= allowed:
+                        continue
+                    on_node = [pod for pod in owned
+                               if (pod.get("spec") or {}).get("nodeName") == node]
+                    moves.extend(on_node[allowed:])
+                workloads.append({"kind": kind, "namespace": namespace, "name": name,
+                                  "replicas": replicas,
+                                  "ready": int(status.get("readyReplicas") or 0),
+                                  "placement": placement,
+                                  "would_move": len(moves)})
+                for pod in moves:
+                    plan.append((namespace, pod.get("metadata", {}).get("name") or "", kind, name))
+        return workloads, plan, bare, ""
+
+    def _rebalance_preview(self) -> None:
+        try:
+            workloads, plan, bare, _ = self._rebalance_plan()
+        except RuntimeError as reason:
+            self._send_json(503, {"ok": False, "error": str(reason)})
+            return
+        self._send_json(200, {"ok": True, "annotation": REBALANCE_ANNOTATION,
+                              "workloads": workloads, "would_move": len(plan),
+                              "bare_pods": bare})
+        return
+
+    def _rebalance_apply(self) -> None:
+        """Delete ONLY the pods sitting on over-full nodes; their controller recreates them.
+
+        Nothing is created here: the workload's own controller makes the replacement, exactly as
+        it does when a node is removed. The pods left alone never restart.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            host = (self.headers.get("Host") or "").strip()
+            if host and origin not in (f"https://{host}", f"http://{host}"):
+                # The session cookie would otherwise let any page on the internet move the user's
+                # pods with a form post.
+                self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+                return
+        try:
+            workloads, plan, bare, _ = self._rebalance_plan()
+        except RuntimeError as reason:
+            self._send_json(503, {"ok": False, "error": str(reason)})
+            return
+        conf = self.membership.kubeconfig
+        moved, failed = [], []
+        for namespace, pod_name, kind, workload in plan:
+            ok, error = kubectl_run(
+                conf, "-n", namespace, "delete", "pod", pod_name,
+                "--grace-period=1", "--wait=false", timeout=30)
+            entry = {"namespace": namespace, "pod": pod_name,
+                     "workload": f"{kind}/{workload}"}
+            if ok:
+                moved.append(entry)
+            else:
+                failed.append({**entry, "error": error})
+        log(f"{self.client_address[0]} rebalanced: deleting {len(moved)} pod(s), "
+            f"{len(failed)} failure(s)")
+        self._send_json(200, {"ok": True, "moved": moved, "failed": failed,
+                              "bare_pods": bare, "workloads": workloads})
+
     def _standalone(self, path: str) -> None:
         """The detached machine's own view: itself, and a way back into a cluster."""
         if path == "/kubeos-standalone/state":
@@ -1188,6 +1487,31 @@ class Gateway(BaseHTTPRequestHandler):
             self._busy(str(reason))
             return
 
+        # Every HTML page from Headlamp gets the watchdog. Buffered on purpose: the body is the
+        # SPA's index (a few KB), and a Content-Length that is off by the injected script's length
+        # would truncate the page instead of fixing it.
+        content_type = (response.getheader("Content-Type") or "").lower()
+        if (self.command == "GET" and "text/html" in content_type
+                and not self._is_websocket()):
+            raw = response.read()
+            connection.close()
+            if WATCH_SNIPPET not in raw:
+                if b"</body>" in raw:
+                    raw = raw.replace(b"</body>", WATCH_SNIPPET + b"</body>", 1)
+                else:
+                    raw = raw + WATCH_SNIPPET
+            self.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                lower = key.lower()
+                if lower in HOP_BY_HOP or lower == "content-length":
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            self.wfile.flush()
+            return
+
         self.send_response(response.status, response.reason)
         forwarded_length = None
         for key, value in response.getheaders():
@@ -1300,6 +1624,29 @@ class Gateway(BaseHTTPRequestHandler):
         if path == "/kubeos-node-health":
             state, detail = self.membership.snapshot()
             self._send_json(200, host_health(state, detail))
+            return
+
+        if path == "/kubeos-watch.js":
+            self._send(200, WATCH_JS, content_type="application/javascript; charset=utf-8")
+            return
+
+        if path == "/kubeos-cluster-health":
+            state, detail = self.membership.snapshot()
+            # "member" is exactly what the probe says after asking THIS node's API server for this
+            # node's own object: an answer means the cluster is reachable from here.
+            reachable = state == "member"
+            self._send_json(200, {"ok": True, "api_reachable": reachable,
+                                  "state": state,
+                                  "detail": "" if reachable else
+                                  (detail or "the cluster API is not answering")})
+            return
+
+        if path == "/kubeos-rebalance":
+            # Behind the login gate on purpose: this restarts the user's workloads.
+            if self.command in ("POST", "PUT"):
+                self._rebalance_apply()
+            else:
+                self._rebalance_preview()
             return
 
         if path.startswith("/kubeos-standalone"):

@@ -1,7 +1,7 @@
 {
-  "name": "kubeos-branding",
+  "name": "kubeos",
   "version": "0.1.0",
-  "description": "KubeOS theme and logo for Headlamp.",
+  "description": "KubeOS: theme, logo, node actions and the KubeOS pages (Nodes, Join Cluster, Rebalance, Snapshots, Disks, NFS).",
   "license": "Apache-2.0",
   "author": "KubeOS contributors",
   "private": true,

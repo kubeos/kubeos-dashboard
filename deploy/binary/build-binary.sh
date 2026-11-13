@@ -23,7 +23,7 @@
 #        cluster.
 #
 # The plugin bundle must be built first (it is committed, but rebuild it after editing):
-#     cd kubeos-branding && npm run build
+#     cd kubeos && npm run build
 set -eu
 
 log() { printf 'build-binary: %s\n' "$*"; }
@@ -43,7 +43,7 @@ HEADLAMP_VERSION=${HEADLAMP_VERSION:-v0.46.0}
 IMAGE_REPO=${IMAGE_REPO:-headlamp-k8s/headlamp}
 BINARY_LAYER=${BINARY_LAYER:-sha256:f745ef7900f22b212a50bd446fb6a1a180457b1ddc1b80116e1e223295eb4a16}
 FRONTEND_LAYER=${FRONTEND_LAYER:-sha256:103033326ffd8d7fb9298ae1f16ee875769bf0e15fa4cd45764f3dd4e7f5659c}
-PLUGIN_DIST=$REPO/kubeos-branding/dist
+PLUGIN_DIST=$REPO/kubeos/dist
 VENDOR_DIR=$REPO/vendor/headlamp/$HEADLAMP_VERSION
 
 # auto   = vendored files if present, ghcr.io otherwise (the normal build)
@@ -114,7 +114,7 @@ fetch_layer() { # fetch_layer <digest> <file>
 }
 
 # ---- inputs -------------------------------------------------------------
-[ -s "$PLUGIN_DIST/main.js" ] || die "no plugin bundle at $PLUGIN_DIST/main.js - run: cd kubeos-branding && npm run build"
+[ -s "$PLUGIN_DIST/main.js" ] || die "no plugin bundle at $PLUGIN_DIST/main.js - run: cd kubeos && npm run build"
 
 # Is dist/main.js older than src/? Two things make the naive test wrong:
 #   * in a fresh clone every file gets the checkout time, so a src file can land a few
@@ -125,13 +125,13 @@ fetch_layer() { # fetch_layer <digest> <file>
 # So ask the build's own mtimes and tolerate a 2 s checkout skew.
 plugin_is_stale() {
     dist_t=$(stat -c %Y "$PLUGIN_DIST/main.js" 2>/dev/null) || return 1
-    [ -n "$(find "$REPO/kubeos-branding/src" \( -name '*.tsx' -o -name '*.ts' \) \
+    [ -n "$(find "$REPO/kubeos/src" \( -name '*.tsx' -o -name '*.ts' \) \
         -newermt "@$((dist_t + 2))" 2>/dev/null | head -1)" ]
 }
 plugin_is_stale &&
-    log "WARNING: kubeos-branding/src is newer than dist/main.js - the release would ship an old plugin"
-VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/kubeos-branding/package.json" | head -1)
-[ -n "$VERSION" ] || die "cannot read the plugin version from kubeos-branding/package.json"
+    log "WARNING: kubeos/src is newer than dist/main.js - the release would ship an old plugin"
+VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/kubeos/package.json" | head -1)
+[ -n "$VERSION" ] || die "cannot read the plugin version from kubeos/package.json"
 NAME=kubeos-dashboard-${VERSION}-linux-amd64
 STAGE=$OUT/$NAME
 
@@ -162,7 +162,7 @@ fi
 # ---- assemble -----------------------------------------------------------
 log "assembling $NAME"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos-branding" \
+mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos" \
     "$STAGE/systemd" "$STAGE/console"
 
 TMP=$CACHE/extract
@@ -175,7 +175,7 @@ tar -xzf "$CACHE/frontend.tgz" -C "$TMP"
 cp "$TMP/headlamp/headlamp-server" "$STAGE/bin/headlamp-server"
 chmod 0755 "$STAGE/bin/headlamp-server"
 cp -a "$TMP/headlamp/frontend/." "$STAGE/share/frontend/"
-cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kubeos-branding/"
+cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kubeos/"
 
 cp "$HERE/install.sh" "$HERE/uninstall.sh" "$STAGE/"
 cp "$HERE/kubeos-dashboard.service" "$HERE/kubeos-dashboard.env.example" "$STAGE/systemd/"
@@ -194,7 +194,7 @@ chmod 0644 "$STAGE/console/console.py"
 cp "$HERE/README.md" "$STAGE/"
 chmod 0755 "$STAGE/install.sh" "$STAGE/uninstall.sh"
 # We redistribute upstream's binary, so upstream's licence and notice travel with it.
-for f in LICENSE NOTICE; do
+for f in LICENSE NOTICE LICENSE.headlamp; do
     [ -f "$REPO/$f" ] || die "missing $f - it must ship with the vendored upstream binary"
     cp "$REPO/$f" "$STAGE/$f"
 done
