@@ -2132,3 +2132,31 @@ Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
   described the removed container+Helm delivery, so its layout table, versions table and build snippet were rewritten for
   the host-release flow, and the `image/Dockerfile` reference in `kubeos/src/index.tsx` became "the vendored upstream
   bundle". `release/` is now 173 MB (the tarball + unpacked release only). Nothing about the running product changed.
+
+### 2026-11-13 14:45 — KubeOS declares itself `0.1.0 alpha` (versions now agree)
+
+The ISO tree used to call itself `v1.0` (`os-release`, `issue`, `motd`, `lsb-release`, `--iso-volume`) while this
+dashboard was already `0.1.0` — two numbers for one product. User decision: *"ok then replace everywhere KubeOS 1.0 to
+KubeOS 0.1.0 alpha"*. Done in `~/KubeOS` (9 files, uncommitted): human text `KubeOS Linux 0.1.0 alpha (Orhan)`, machine
+tag `v0.1.0-alpha.1`, `VERSION_ID="0.1.0"`. **Nothing to change here**: `kubeos/package.json` was already `0.1.0`, and
+the release tarball name `kubeos-dashboard-0.1.0-linux-amd64` matches. Two consequences for this repo: (1) a release
+tarball name must stay `kubeos-dashboard-<version>-linux-amd64` and follow the same number, and (2) the stage is **alpha**
+— one control plane, no upgrade path, no CI, no tags — so do not tag or describe anything here as `1.0` or as beta until
+the ISO ships this dashboard and an upgrade path exists. Historical entries above that quote the old `v1.0 (Orhan)` banner
+stay as they are (append-only log).
+
+### 2026-11-13 15:20 — the KubeOS ISO is named after the release now
+
+The ISO that will carry this dashboard is no longer `live-image-amd64.hybrid.iso`: `~/KubeOS/auto/config` sets
+`--image-name "kubeos-0.1.0-alpha"`, so the build produces **`kubeos-0.1.0-alpha-amd64.hybrid.iso`** (plus `.zsync`,
+`.contents`, `.files`, `.packages` with the same prefix). Nothing changes in this repo — the dashboard release tarball
+keeps its own name (`kubeos-dashboard-0.1.0-linux-amd64.tar.gz`) — but any install documentation that tells a user which
+file to download must use the new ISO name. Measured on the builder: the last ISO is **1.5 GB**, so it is far beyond
+Cloudflare Pages' 25 MiB-per-asset limit; the planned hosting is an R2 bucket behind a `downloads.` subdomain.
+
+### 2026-11-13 15:45 — the downloadable image is `kubeos-0.1.0-alpha-amd64.iso`
+
+The `.hybrid` infix live-build adds for `--binary-image iso-hybrid` is now stripped after the build by
+`~/KubeOS/tools/rename-iso.sh`, called from `~/KubeOS/auto/build` (a `.zsync` control file repeats the file name in its
+header, so that is rewritten too). So the artifact a user downloads, and any install documentation must name, is
+**`kubeos-0.1.0-alpha-amd64.iso`** (+ `.zsync`). Nothing in this repo changes.
