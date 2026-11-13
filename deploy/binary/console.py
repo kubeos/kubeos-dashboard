@@ -543,6 +543,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/etcd/snapshot":
             self._snapshot_post()
             return
+        if path == "/action/lvm":
+            self._lvm_post()
+            return
         if not path.startswith("/action/"):
             self.send_error(404)
             return
@@ -612,6 +615,136 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"hostname": host, "addresses": addresses, "units": units,
                          "member": member,
                          "dashboard_kubeconfig": os.path.exists(self.DASHBOARD_KUBECONFIG)})
+
+    # ---- LVM objects, created on the node by THIS service -------------------
+    # WHY HERE AND NOT IN A POD: the Disks page used to start a privileged one-shot Job
+    # (hostPID, host root at /host, `nsenter -t 1`) to run pvcreate/vgcreate/lvcreate. It
+    # worked, but it broke the rule this product is built on - a dashboard button must not
+    # create a Pod - it left a Job (and its pod log) behind for a storage click, it needed
+    # pods/jobs create permission on the node's identity, and a shutdown could strand the
+    # container. The console is already the node's own root service (Restart, Power off and
+    # Shell go through it), so LVM belongs here: the same privilege, no object.
+    LVM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]{0,126}$")
+    # A whole disk as lsblk names it: /dev/vdb, /dev/sda, /dev/nvme0n1, /dev/mmcblk0.
+    LVM_DEVICE_RE = re.compile(r"^/dev/(?:[a-z]+[a-z0-9]*|[a-z]+[a-z0-9]*n[0-9]+|mmcblk[0-9]+)$")
+    # lvcreate -L size: a number with a unit, e.g. 8g / 512m / 1.5t.
+    LVM_SIZE_RE = re.compile(r"^[0-9]{1,6}(?:\.[0-9]{1,3})?[mMgGtT]$")
+    LVM_REPORT_UNIT = "kubeos-disks-report.service"
+    LVM_TIMEOUT = 120
+    lvm_lock = threading.Lock()
+
+    def _lvm_error(self, code: int, message: str) -> None:
+        self._json(code, {"ok": False, "error": message})
+
+    def _lvm_run(self, argv: list[str]) -> tuple[bool, str]:
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=self.LVM_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as reason:
+            return False, f"{argv[0]} could not run: {reason}"
+        output = ((done.stdout or "") + (done.stderr or "")).strip()
+        return done.returncode == 0, output[-800:]
+
+    def _lvm_post(self) -> None:
+        if not self._action_allowed():
+            log(f"{self.client_address[0]} refused /action/lvm: bad token or origin")
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._lvm_error(400, "bad Content-Length")
+            return
+        if length <= 0 or length > 8192:
+            self._lvm_error(400, "expected a small JSON body")
+            return
+        try:
+            request = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError):
+            self._lvm_error(400, "the body is not JSON")
+            return
+        if not isinstance(request, dict):
+            self._lvm_error(400, "the body must be a JSON object")
+            return
+
+        action = str(request.get("action") or "")
+        name = str(request.get("name") or "")
+        if not self.LVM_NAME_RE.match(name):
+            self._lvm_error(400, "invalid name: letters, digits and +_.- only, no leading '-'")
+            return
+
+        # One LVM action at a time: two dialogs (or a double click) must not race on the same
+        # volume group, and `vgcreate` is not fast.
+        if not self.lvm_lock.acquire(blocking=False):
+            self._lvm_error(409, "another LVM action is still running")
+            return
+        try:
+            if action == "vgcreate":
+                message, code = self._lvm_vgcreate(name, str(request.get("device") or ""))
+            elif action == "thinpool":
+                message, code = self._lvm_thinpool(
+                    name, str(request.get("volumeGroup") or ""), str(request.get("size") or ""))
+            else:
+                message, code = f"unknown action: {action}", 400
+            if code != 200:
+                log(f"{self.client_address[0]} refused lvm {action} {name}: {message}")
+                self._lvm_error(code, message)
+                return
+            # The page reads its facts from the report ConfigMap, so refresh it now instead of
+            # waiting up to a minute for the timer.
+            try:
+                subprocess.run(["/usr/bin/systemctl", "start", self.LVM_REPORT_UNIT],
+                               capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            log(f"{self.client_address[0]} created lvm {action} {name}")
+            self._json(200, {"ok": True, "action": action, "name": name, "detail": message})
+        finally:
+            self.lvm_lock.release()
+
+    def _lvm_vgcreate(self, name: str, device: str) -> tuple[str, int]:
+        if not self.LVM_DEVICE_RE.match(device):
+            return "invalid device path", 400
+        if not os.path.exists(device):
+            return f"{device} does not exist", 400
+        ok, kind = self._lvm_run(["/usr/bin/lsblk", "-ndo", "TYPE", device])
+        if not ok or kind.strip() != "disk":
+            return f"{device} is not a whole disk (lsblk says {kind.strip() or 'nothing'})", 400
+        # A disk with partitions on it is in use, whatever it holds: refuse before pvcreate
+        # gets a chance to write anything (lsblk lists the disk itself first, then its children).
+        ok, children = self._lvm_run(["/usr/bin/lsblk", "-rno", "NAME", device])
+        if ok and len(children.strip().splitlines()) > 1:
+            return f"{device} has partitions on it; refusing to overwrite it", 400
+        ok, mounted = self._lvm_run(["/usr/bin/findmnt", "-rn", "-S", device])
+        if ok and mounted.strip():
+            return f"{device} is mounted: {mounted.strip().splitlines()[0]}", 400
+        ok, group = self._lvm_run(["/usr/sbin/pvs", "--noheadings", "-o", "vg_name", device])
+        if ok and group.strip():
+            return f"{device} already belongs to volume group {group.strip()}", 400
+        ok, output = self._lvm_run(["/usr/sbin/pvcreate", "-ff", "-y", device])
+        if not ok:
+            return f"pvcreate failed: {output}", 500
+        ok, output = self._lvm_run(["/usr/sbin/vgcreate", name, device])
+        if not ok:
+            return f"vgcreate failed: {output}", 500
+        return f"volume group {name} created on {device}", 200
+
+    def _lvm_thinpool(self, name: str, volume_group: str, size: str) -> tuple[str, int]:
+        if not self.LVM_NAME_RE.match(volume_group):
+            return "invalid volume group name", 400
+        if size and not self.LVM_SIZE_RE.match(size):
+            return "invalid size (for example 8g, 512m, 1.5t)", 400
+        ok, groups = self._lvm_run(["/usr/sbin/vgs", "--noheadings", "-o", "vg_name"])
+        if not ok:
+            return f"could not list volume groups: {groups}", 500
+        if volume_group not in groups.split():
+            return f"volume group {volume_group} does not exist", 400
+        argv = ["/usr/sbin/lvcreate", "--type", "thin-pool"]
+        argv += ["-L", size] if size else ["-l", "100%FREE"]
+        argv += ["-n", name, volume_group]
+        ok, output = self._lvm_run(argv)
+        if not ok:
+            return f"lvcreate failed: {output}", 500
+        return f"thin pool {name} created in {volume_group}", 200
 
     # ---- etcd snapshots ---------------------------------------------------
     # WHY A HOST SERVICE AND NOT A PROVISIONER POD: a snapshot is the only thing that can

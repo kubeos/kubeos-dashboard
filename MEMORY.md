@@ -2160,3 +2160,22 @@ The `.hybrid` infix live-build adds for `--binary-image iso-hybrid` is now strip
 `~/KubeOS/tools/rename-iso.sh`, called from `~/KubeOS/auto/build` (a `.zsync` control file repeats the file name in its
 header, so that is rewritten too). So the artifact a user downloads, and any install documentation must name, is
 **`kubeos-0.1.0-alpha-amd64.iso`** (+ `.zsync`). Nothing in this repo changes.
+
+### 2026-11-13 16:00 — senior-tester audit: 4 gateway defects fixed (commit a94ac18)
+
+Reproduced on the live 4-node fleet before changing anything, then fixed in `deploy/binary/authproxy.py`:
+1. **Reflected XSS** on the login page — `user=" autofocus onfocus="alert(1)` rendered a live event handler and
+   `user="><script>alert(1)</script>` came back verbatim. Now `html.escape(..., quote=True)` for `__USER__`, `__ERROR__`,
+   `__HOST__` and for the join page's `__STEP__`.
+2. **The lockout refused the correct password** — the limiter ran before the password check, so anybody could lock the
+   real admin out for 300 s. Password is verified first now; 429 is for wrong passwords only; a success clears the
+   counter; hard cap 50/window keeps the check from being a CPU lever. A/B proven on kubeos4 with a real sudo-group
+   account (old = 429 for the right password, new = 303 + cookie while limited).
+3. **Spoofable `X-Forwarded-For`/`-Proto`** — inbound copies are dropped by name before the trusted values are set.
+4. **No socket timeout / body cap** on the login port — `timeout = 30`, 32 MiB cap (413), bad `Content-Length` answers 400.
+
+Still open here (register: 28 rows, verified ones quoted in the KubeOS repo's `docs/AUDIT-2026-11-13.md`):
+**A1 the Disks page creates a privileged Job** (`kubeos/src/disks.tsx:483`, hostPID + host `/` + `nsenter`) which the
+user's 2026-11-12 rule forbids — it must move to `kubeos-console`; A3 the console root-token sits in a download URL;
+A6 logout does not revoke the stateless session; A7 no `waitpid`/`killpg` in the PTY service; A8 `--no-login` leaves the
+gateway on the port; A16 a re-install overwrites the kubeconfig.
