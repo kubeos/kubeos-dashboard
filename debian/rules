@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+# KubeOS dashboard packaging: the payload is the repository's own release archive.
+%:
+	dh $@
+
+# Build the release the same way a human does, offline from vendor/ - no registry, no npm.
+override_dh_auto_build:
+	sh deploy/binary/build-binary.sh
+
+# Install it exactly where the ISO put it: kubeos-dashboard-install (in kubeos-cli) reads
+# RELEASE, verifies SHA256 and unpacks the tarball into this directory. Keeping that layout
+# means the first-boot path needs no change at all.
+override_dh_auto_install:
+	install -d -m 0755 debian/kubeos-dashboard/usr/share/kubeos/dashboard
+	set -e; tarball=$$(ls release/kubeos-dashboard-*-linux-amd64.tar.gz | head -n 1); \
+	  name=$$(basename "$$tarball" .tar.gz); \
+	  install -m 0644 "$$tarball" debian/kubeos-dashboard/usr/share/kubeos/dashboard/; \
+	  echo "$$name" > debian/kubeos-dashboard/usr/share/kubeos/dashboard/RELEASE; \
+	  ( cd release && sha256sum "$$name.tar.gz" ) > debian/kubeos-dashboard/usr/share/kubeos/dashboard/SHA256
+	chmod 0644 debian/kubeos-dashboard/usr/share/kubeos/dashboard/RELEASE \
+	           debian/kubeos-dashboard/usr/share/kubeos/dashboard/SHA256
+
+# Nothing under /etc: no conffiles (D5).
+override_dh_installdeb:
+	dh_installdeb
+	: > debian/kubeos-dashboard/DEBIAN/conffiles

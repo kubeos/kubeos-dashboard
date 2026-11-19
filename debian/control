@@ -1,0 +1,21 @@
+Source: kubeos-dashboard
+Section: admin
+Priority: optional
+Maintainer: KubeOS <mail@kubeos.in>
+Build-Depends: debhelper-compat (= 13), tar, gzip, coreutils
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://kubeos.in/
+
+Package: kubeos-dashboard
+Architecture: all
+Depends: ${misc:Depends}, python3, ca-certificates
+Description: the KubeOS web dashboard (Headlamp-based, run as host services)
+ The dashboard payload: a Headlamp server build with the KubeOS plugin, plus the console
+ and the authenticating gateway, all run as systemd services on the node instead of as
+ Pods, because a KubeOS base system runs no Pods at all.
+ .
+ The package ships the release archive the way the ISO used to, so
+ kubeos-dashboard-install - which verifies its checksum, unpacks it and runs the
+ release's own installer at first boot - needs no change: updates arrive through apt
+ instead of through a new ISO.

@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Headlamp (KubeOS build)
+Source: https://github.com/kubernetes-sigs/headlamp
+
+Files: *
+Copyright: The Headlamp Authors; KubeOS contributors
+License: Apache-2.0
+ On Debian systems the full text of the Apache License 2.0 is in
+ /usr/share/common-licenses/Apache-2.0. The release archive carries its own LICENSE,
+ NOTICE and LICENSE.headlamp.

@@ -1,0 +1,8 @@
+kubeos-dashboard (0.1.0-1kubeos1) trixie; urgency=medium
+
+  * Initial packaging. The release archive is built from this repository with
+    deploy/binary/build-binary.sh (offline, from vendor/) at package build time, and
+    installed at /usr/share/kubeos/dashboard/ with the RELEASE marker and SHA256 that
+    kubeos-dashboard-install expects, so the first-boot installer is untouched.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 10:15:00 +0530
