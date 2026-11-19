@@ -1,0 +1,18 @@
+# Build this package on every push, with the shared workflow the other KubeOS package
+# repositories use (kubeos-apt/.github/workflows/deb-build.yml). Verify-only: it never signs
+# and never publishes.
+#
+# This repository is private, so its runs are visible to the owner only. The deb is built from
+# the release archive committed under vendor/release/ - debian/rules installs that artefact and
+# verifies it against SHA256 at build time, so nothing is rebuilt here either.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  deb:
+    uses: kubeos/kubeos-apt/.github/workflows/deb-build.yml@main
+    with:
+      package: kubeos-dashboard
