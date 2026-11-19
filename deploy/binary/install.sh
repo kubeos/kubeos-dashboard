@@ -565,6 +565,6 @@ fi
 if [ "$DO_CONSOLE" -eq 1 ]; then
     log ""
     log "Host console: https://${show_host:-<node-ip>}:$CONSOLE_PORT/  <- open once per browser"
-    log "  it is what the dashboard's "Shell" button connects to (no Pod is created)"
+    log "  it is what the dashboard's 'Shell' button connects to (no Pod is created)"
     log "  service   systemctl status $CONSOLE_SERVICE"
 fi
