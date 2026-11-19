@@ -144,7 +144,7 @@ done
 [ -f "$KUBECONFIG_SRC" ] || die "no such file: $KUBECONFIG_SRC"
 [ -x "$SRC/bin/headlamp-server" ] || die "incomplete release: $SRC/bin/headlamp-server is missing"
 [ -s "$SRC/share/frontend/index.html" ] || die "incomplete release: $SRC/share/frontend/index.html is missing"
-[ -s "$SRC/share/plugins/kubeos-branding/main.js" ] || die "incomplete release: the KubeOS plugin bundle is missing"
+[ -s "$SRC/share/plugins/kubeos/main.js" ] || die "incomplete release: the KubeOS plugin bundle is missing"
 
 # ---- user ----------------------------------------------------------------
 if ! id "$RUN_USER" >/dev/null 2>&1; then

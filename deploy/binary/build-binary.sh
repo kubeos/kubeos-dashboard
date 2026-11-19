@@ -162,7 +162,7 @@ fi
 # ---- assemble -----------------------------------------------------------
 log "assembling $NAME"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos-branding" \
+mkdir -p "$STAGE/bin" "$STAGE/share/frontend" "$STAGE/share/plugins/kubeos" \
     "$STAGE/systemd" "$STAGE/console"
 
 TMP=$CACHE/extract
@@ -175,7 +175,7 @@ tar -xzf "$CACHE/frontend.tgz" -C "$TMP"
 cp "$TMP/headlamp/headlamp-server" "$STAGE/bin/headlamp-server"
 chmod 0755 "$STAGE/bin/headlamp-server"
 cp -a "$TMP/headlamp/frontend/." "$STAGE/share/frontend/"
-cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kubeos-branding/"
+cp "$PLUGIN_DIST/main.js" "$PLUGIN_DIST/package.json" "$STAGE/share/plugins/kubeos/"
 
 cp "$HERE/install.sh" "$HERE/uninstall.sh" "$STAGE/"
 cp "$HERE/kubeos-dashboard.service" "$HERE/kubeos-dashboard.env.example" "$STAGE/systemd/"
