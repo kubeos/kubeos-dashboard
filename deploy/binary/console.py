@@ -406,6 +406,24 @@ class Handler(BaseHTTPRequestHandler):
     token = ""
     shell = "/bin/bash"
 
+    # SECURITY (SECURITY-REVIEW.md S6): one place that adds the browser protections to every
+    # response this console sends, proxied ones included. Only headers that cannot change how a
+    # page renders: framing denied, no MIME sniffing, no referrer leak, HTTPS pinned. A full
+    # Content-Security-Policy is deliberately NOT set here - it has to be tested in a browser
+    # against this service first, or a wrong policy blanks the UI.
+    SECURITY_HEADERS = (
+        ("X-Frame-Options", "DENY"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Content-Security-Policy", "frame-ancestors 'none'"),
+        ("Strict-Transport-Security", "max-age=31536000"),
+    )
+
+    def end_headers(self):
+        for key, value in self.SECURITY_HEADERS:
+            self.send_header(key, value)
+        super().end_headers()
+
     def log_message(self, fmt: str, *args) -> None:  # journald gets enough
         # The WebSocket handshake carries the token in its query string; the journal is not
         # the place for it.
