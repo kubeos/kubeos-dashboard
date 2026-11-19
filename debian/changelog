@@ -1,12 +1,24 @@
+kubeos-dashboard (0.1.0-5) trixie; urgency=medium
 
+  * Ship the release archive itself instead of rebuilding it. The package carries the exact
+    tarball that was verified in the ISO (vendor/release, its sha256 checked at build time),
+    so package content and tested artefact are the same bytes by construction. Rebuilding
+    from source meant trusting a branch, and doing that shipped main - which is behind dev -
+    dropping the rebalance feature and the etcd-snapshot fix.
+  * Version numbering follows Debian exactly from here: upstream version 0.1.0, revision 5
+    (the fifth packaging revision of this upstream version).
 
- d5b995c (feat: ship the verified release archive, do not rebuild it)
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 20:45:00 +0530
+
+kubeos-dashboard (0.1.0-1kubeos2) trixie; urgency=medium
+
+  * (superseded numbering) rebuilt with the plugin published as id "kubeos" again.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 19:20:00 +0530
 
 kubeos-dashboard (0.1.0-1kubeos1) trixie; urgency=medium
 
-  * Initial packaging. The release archive is built from this repository with
-    deploy/binary/build-binary.sh (offline, from vendor/) at package build time, and
-    installed at /usr/share/kubeos/dashboard/ with the RELEASE marker and SHA256 that
-    kubeos-dashboard-install expects, so the first-boot installer is untouched.
+  * Initial packaging: the release archive installed at /usr/share/kubeos/dashboard/ with the
+    RELEASE marker and SHA256 that kubeos-dashboard-install verifies.
 
  -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 10:15:00 +0530
