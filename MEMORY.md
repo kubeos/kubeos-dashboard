@@ -2184,3 +2184,16 @@ Still open here (register: 28 rows, verified ones quoted in the KubeOS repo's `d
 user's 2026-11-12 rule forbids — it must move to `kubeos-console`; A3 the console root-token sits in a download URL;
 A6 logout does not revoke the stateless session; A7 no `waitpid`/`killpg` in the PTY service; A8 `--no-login` leaves the
 gateway on the port; A16 a re-install overwrites the kubeconfig.
+
+- 2026-11-20 - **branches unified: `main` carries the code AND the packaging, `test` is gone.** Found while tidying the
+  branch layout: `test` (the branch that shipped `vendor/release/*.tar.gz`) contained `debian/`, the archive and the CI
+  workflow but **no `kubeos/` plugin source at all** - that lived only on `dev`, seven commits ahead of `main` (and
+  `main` had nothing `dev` lacked). So the branch that produced the release archive did not contain the code inside it,
+  the same trap as the 2026-11-19 `main`-vs-`dev` mix-up, this time in branch form. Fixed by merging `dev` into `test`
+  (conflicts only in `.gitignore` and `MEMORY.md`, both resolved as a **union** because both files are append-only; the
+  two scripts auto-merged and were re-checked afterwards - shellcheck clean over all four, the `'Shell'` quoting fix
+  intact), fast-forwarding `main`, pushing it and **deleting `test`** on the remote and locally. `main` = `507b826`
+  (default branch), `dev` = `24d5255`. Proof it still ships: the merged tree was rebuilt on the builder -
+  `kubeos-dashboard 0.1.0-5` builds and lintian reports 0 E: tags, and `git diff origin/dev..main` is packaging + CI
+  only (12 files). Also dropped `debian/kubeos-dashboard.debhelper.log`, a build log that had been committed.
+  Working rule now: develop on `dev`, release by merging `dev` into `main`; the package is built from what `main` holds.
