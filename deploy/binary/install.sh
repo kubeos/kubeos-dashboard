@@ -171,9 +171,29 @@ log "installed the binary, the frontend and the plugin"
 # upstream release, which the release tarball guarantees. The VERSION file is kept
 # next to the binary so an operator can see what is installed.
 [ -f "$SRC/VERSION" ] && install -m 0644 "$SRC/VERSION" "$BIN_DIR/VERSION"
+# The licences must reach whoever receives this software, not just whoever unpacks the
+# tarball: Apache-2.0 asks for the notice to accompany the distribution, and upstream
+# Headlamp's own notice travels with the binary we redistribute.
+DOC_DIR=/usr/share/doc/kubeos-dashboard
+install -d -m 0755 "$DOC_DIR"
+for doc in LICENSE NOTICE LICENSE.headlamp; do
+    if [ -f "$SRC/$doc" ]; then
+        install -m 0644 "$SRC/$doc" "$DOC_DIR/$doc"
+    else
+        log "WARNING: $doc is missing from the release - tell the maintainer"
+    fi
+done
 
-install -m 0600 -o "$RUN_USER" -g "$RUN_USER" "$KUBECONFIG_SRC" "$CONF_DIR/kubeconfig"
-log "kubeconfig installed as $CONF_DIR/kubeconfig (the identity the dashboard uses for everyone)"
+# Re-pointing a node at its OWN kubeconfig is the normal case for a re-run after a join or a
+# certificate renewal, and `install` refuses it ("are the same file"), which aborted this script
+# and left the rest of the re-run undone (found by kubeos-cert-renew on 2026-11-13: "the
+# dashboard's installer failed" while everything up to here had worked).
+if [ "$(readlink -f "$KUBECONFIG_SRC")" = "$(readlink -f "$CONF_DIR/kubeconfig")" ]; then
+    log "kubeconfig kept: $CONF_DIR/kubeconfig is already the one passed in"
+else
+    install -m 0600 -o "$RUN_USER" -g "$RUN_USER" "$KUBECONFIG_SRC" "$CONF_DIR/kubeconfig"
+    log "kubeconfig installed as $CONF_DIR/kubeconfig (the identity the dashboard uses for everyone)"
+fi
 
 # The dashboard derives its cluster id, its URLs and its page title from this context name.
 current_context=""

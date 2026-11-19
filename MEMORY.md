@@ -2069,3 +2069,118 @@ Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
   **host:port, no scheme**, because it is handed straight to `kubeadm join`, which rejects a URL (`too many colons in
   address`). Confirmed on kubeos2: with a bare endpoint the join, the kube-proxy identity and the DNS DNAT
   (`kube-dns:dns -> 192.168.122.5:53`) all came out right. The dashboard code was already correct and was not touched.
+- **2026-11-13 10:30 - the "Rebalance" page: the answer to "pods don't spread after a node is added".** The user
+  measured it correctly on a 4-node cluster (2/2/0/0 with every node Ready, no taints, no cordons, identical
+  allocatable, and `topologySpreadConstraints maxSkew=1` already in the Deployment): Kubernetes sets `.spec.nodeName`
+  once, at pod creation, and never revisits it - spread rules only apply while scheduling a NEW pod, which is exactly why
+  removing a node works and adding one does not. They chose a dashboard action over a DaemonSet balancer.
+  New: gateway `GET /kubeos-rebalance` (workloads + per-node placement + how many pods would move) and
+  `POST /kubeos-rebalance` (deletes ONLY the surplus pods on over-full nodes; the workload's own controller recreates
+  them, so **KubeOS creates no Pod**), both behind the login gate with an Origin check; plugin `src/rebalance.tsx`
+  (sidebar "Rebalance", table, confirm dialog, bare-pod note, result list). Two measurements decided the design:
+  `rollout restart` (annotation on the pod template) ended 1/2/1/0 because a rolling update replaces pods while the old
+  ones still occupy the crowded nodes; deleting just the surplus gave 1/1/1/1. Also: `kubectl patch`/`delete` print prose
+  rather than JSON, so the first implementation reported a successful delete as a parse error - `kubectl_run()` handles
+  non-JSON commands. Verified live: balanced -> `would_move 0` ("Already spread"); cordon kubeos4 + evict + uncordon ->
+  `would_move 1` -> moved -> 2/2/1/1 with 6 replicas ready. Plugin `db2c7d09...` on all four nodes, release rebuilt
+  (`88673d68...`). Uncommitted: commit and push only when the user asks (development branch only).
+
+- **2026-11-13 11:20 - the blank "three dots" page after a refresh is Headlamp waiting for a cluster API that is not
+  there.** The user's `refreshor.png` showed a black page with three dots. The node's journals named the cause:
+  `headlamp-server: http: proxy error: dial tcp 192.168.122.5:6443: connect: no route to host` with a burst of 502s on
+  `/clusters/main/...` - the SPA stays on its loading screen and never explains or retries (measured healthy timings:
+  `/` 19 ms, `/clusters/main/version` 50 ms, `/clusters/main/api/v1/nodes` 78 ms, so it is a window, not slowness).
+  Fix: the gateway buffers proxied HTML and injects `<script src="/kubeos-watch.js" defer>`; that script polls the new
+  `/kubeos-cluster-health` (membership probe: `member` = API answered) every 3 s, covers the page with a branded
+  "Waiting for the cluster" card plus the real reason after two failures, and reloads the page itself when the API is back.
+  Verified both ways (injected in `/` and `/c/main/nodes`, `node --check` valid; dead-port test returned
+  `api_reachable false`, restore returned `true`). Deployment pattern for the next persons: this kind of UI patch belongs
+  in the gateway (`WATCH_SNIPPET`/`WATCH_JS`), because a plugin cannot style a screen that Headlamp paints before the
+  plugin's routes exist. Release rebuilt (`28bfbf7e...`). Uncommitted - push only development, only when asked.
+
+- **2026-11-13 11:35 - senior-tester pass on the dashboard: 3 findings, everything else green.** Verified live on the
+  4-node cluster: every `/kubeos-*` and `/clusters/*` endpoint answers 401 without a session (only `/` = the sign-in page
+  and `/kubeos-ca.crt` = the public CA certificate are open, both deliberate - the CA must be downloadable before login to
+  trust TLS); session cookie is `HttpOnly; Secure; SameSite=Strict; Max-Age=43200`; `/kubeos-logout` invalidates it
+  (303 then 401); the login page's fingerprint equals `openssl` on `/etc/kubeos-dashboard/ca.crt`; `POST
+  /kubeos-rebalance` refuses a foreign Origin (403) and accepts its own (200); the plugin bundle served is byte-identical
+  to the file on disk; the watchdog is injected exactly once into `/` and `/c/main/nodes`; `/kubeos-node-health` returns
+  real host data; the rebalance preview reports 0 moves when the cluster is spread; the snapshot cycle works
+  (POST 201, 3.2 MB, list, download equal bytes, delete) and a worker refuses with 409; the shell socket upgrades to 101
+  for browser-like headers and 403s a foreign Origin or a bad token; all four dashboards list 4/4 Ready nodes.
+  **Findings:** (1) medium - the login rate limit is per IP with `FAIL_LIMIT=5` / `FAIL_WINDOW=300`: the 6th attempt is
+  429 and so is the CORRECT password for the rest of the window (measured, recovery at +300 s). Fix should be "count
+  failures only: verify first, clear on success". (2) low - the shell token travels in the query string (`/ws?token=`),
+  documented but worth knowing. (3) low - no HEAD/range request coverage (Chromium uses ranges for large plugin fetches;
+  not observed broken).
+
+- **2026-11-13 12:15 - the plugin is now called `kubeos`, and its description finally says what it does.** The user asked
+  what the `kubeos-branding` entry in the dashboard's plugin list was; it is our own plugin (theme, logo, title, favicon,
+  Restart/Power off/Shell, the node health card and the Join Cluster / Rebalance / Snapshots / Disks / NFS pages), but the
+  list showed an internal slug and the stale description "KubeOS theme and logo for Headlamp." They chose the rename.
+  Changed: directory `kubeos-branding/` -> `kubeos/` (git sees pure renames), `package.json` `name`/`description`
+  ("KubeOS: theme, logo, node actions and the KubeOS pages (Nodes, Join Cluster, Rebalance, Snapshots, Disks, NFS)"),
+  `package-lock.json` name fields, and every path that pointed at the old id: `build-binary.sh` (PLUGIN_DIST, the freshness
+  check, the version read, `share/plugins/kubeos/`), `install.sh`'s completeness check, `BUILD.md`, `deploy/binary/README.md`.
+  Left alone on purpose: the two CSS element ids `kubeos-branding-links`/`kubeos-branding-charts` (internal, invisible) and
+  the historical entries in this file / `docs/headlamp-survey.md` (rewriting history would hide how the delivery changed).
+  **Deployed and verified on all four nodes** via the rebuilt release: `/plugins/kubeos/main.js` = 200,
+  `/plugins/kubeos-branding/main.js` = **404**, `<title>KubeOS</title>`, served bundle byte-identical to
+  `kubeos/dist/main.js` (`db2c7d09...`), and the manifest served is `name: kubeos` + the new description. Release
+  `d6877798...`. A browser needs one reload to pick up the new plugin path.
+
+- **2026-11-13 12:35 - dead weight removed from this repo after a measured audit.** Deleted the dead `image/` directory
+  (24 KB - the container build path that no longer exists), the dead `kubeos/src/nodesview.tsx` (8 KB, 0 imports since the
+  user asked for the Nodes page to go) and `release/.cache/` (172 MB of build cache, gitignored, regenerated on the next
+  build). Kept on purpose: the user's screenshots (`refreshor.png`, `autherror.png`), `docs/headlamp-survey.md` and
+  `CLI_REQUIREMENTS.md` (decision records), `vendor/` (50 MB, required for offline release builds). The README still
+  described the removed container+Helm delivery, so its layout table, versions table and build snippet were rewritten for
+  the host-release flow, and the `image/Dockerfile` reference in `kubeos/src/index.tsx` became "the vendored upstream
+  bundle". `release/` is now 173 MB (the tarball + unpacked release only). Nothing about the running product changed.
+
+### 2026-11-13 14:45 — KubeOS declares itself `0.1.0 alpha` (versions now agree)
+
+The ISO tree used to call itself `v1.0` (`os-release`, `issue`, `motd`, `lsb-release`, `--iso-volume`) while this
+dashboard was already `0.1.0` — two numbers for one product. User decision: *"ok then replace everywhere KubeOS 1.0 to
+KubeOS 0.1.0 alpha"*. Done in `~/KubeOS` (9 files, uncommitted): human text `KubeOS Linux 0.1.0 alpha (Orhan)`, machine
+tag `v0.1.0-alpha.1`, `VERSION_ID="0.1.0"`. **Nothing to change here**: `kubeos/package.json` was already `0.1.0`, and
+the release tarball name `kubeos-dashboard-0.1.0-linux-amd64` matches. Two consequences for this repo: (1) a release
+tarball name must stay `kubeos-dashboard-<version>-linux-amd64` and follow the same number, and (2) the stage is **alpha**
+— one control plane, no upgrade path, no CI, no tags — so do not tag or describe anything here as `1.0` or as beta until
+the ISO ships this dashboard and an upgrade path exists. Historical entries above that quote the old `v1.0 (Orhan)` banner
+stay as they are (append-only log).
+
+### 2026-11-13 15:20 — the KubeOS ISO is named after the release now
+
+The ISO that will carry this dashboard is no longer `live-image-amd64.hybrid.iso`: `~/KubeOS/auto/config` sets
+`--image-name "kubeos-0.1.0-alpha"`, so the build produces **`kubeos-0.1.0-alpha-amd64.hybrid.iso`** (plus `.zsync`,
+`.contents`, `.files`, `.packages` with the same prefix). Nothing changes in this repo — the dashboard release tarball
+keeps its own name (`kubeos-dashboard-0.1.0-linux-amd64.tar.gz`) — but any install documentation that tells a user which
+file to download must use the new ISO name. Measured on the builder: the last ISO is **1.5 GB**, so it is far beyond
+Cloudflare Pages' 25 MiB-per-asset limit; the planned hosting is an R2 bucket behind a `downloads.` subdomain.
+
+### 2026-11-13 15:45 — the downloadable image is `kubeos-0.1.0-alpha-amd64.iso`
+
+The `.hybrid` infix live-build adds for `--binary-image iso-hybrid` is now stripped after the build by
+`~/KubeOS/tools/rename-iso.sh`, called from `~/KubeOS/auto/build` (a `.zsync` control file repeats the file name in its
+header, so that is rewritten too). So the artifact a user downloads, and any install documentation must name, is
+**`kubeos-0.1.0-alpha-amd64.iso`** (+ `.zsync`). Nothing in this repo changes.
+
+### 2026-11-13 16:00 — senior-tester audit: 4 gateway defects fixed (commit a94ac18)
+
+Reproduced on the live 4-node fleet before changing anything, then fixed in `deploy/binary/authproxy.py`:
+1. **Reflected XSS** on the login page — `user=" autofocus onfocus="alert(1)` rendered a live event handler and
+   `user="><script>alert(1)</script>` came back verbatim. Now `html.escape(..., quote=True)` for `__USER__`, `__ERROR__`,
+   `__HOST__` and for the join page's `__STEP__`.
+2. **The lockout refused the correct password** — the limiter ran before the password check, so anybody could lock the
+   real admin out for 300 s. Password is verified first now; 429 is for wrong passwords only; a success clears the
+   counter; hard cap 50/window keeps the check from being a CPU lever. A/B proven on kubeos4 with a real sudo-group
+   account (old = 429 for the right password, new = 303 + cookie while limited).
+3. **Spoofable `X-Forwarded-For`/`-Proto`** — inbound copies are dropped by name before the trusted values are set.
+4. **No socket timeout / body cap** on the login port — `timeout = 30`, 32 MiB cap (413), bad `Content-Length` answers 400.
+
+Still open here (register: 28 rows, verified ones quoted in the KubeOS repo's `docs/AUDIT-2026-11-13.md`):
+**A1 the Disks page creates a privileged Job** (`kubeos/src/disks.tsx:483`, hostPID + host `/` + `nsenter`) which the
+user's 2026-11-12 rule forbids — it must move to `kubeos-console`; A3 the console root-token sits in a download URL;
+A6 logout does not revoke the stateless session; A7 no `waitpid`/`killpg` in the PTY service; A8 `--no-login` leaves the
+gateway on the port; A16 a re-install overwrites the kubeconfig.

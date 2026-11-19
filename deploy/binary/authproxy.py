@@ -37,6 +37,7 @@ import ctypes
 import ctypes.util
 import grp
 import hashlib
+import html
 import hmac
 import http.client
 import json
@@ -56,7 +57,14 @@ from urllib.parse import parse_qs, urlparse
 SHADOW = "/etc/shadow"
 SESSION_COOKIE = "kubeos_session"
 FAIL_WINDOW = 300.0          # seconds a failed attempt is remembered
-FAIL_LIMIT = 5               # attempts per address inside the window
+FAIL_LIMIT = 5               # wrong passwords per address before the answer is 429
+FAIL_HARD_LIMIT = 50         # above this we stop verifying passwords at all (CPU guard)
+MAX_BODY = 32 << 20          # a proxied request body above this is refused with 413
+# A client may not speak for itself: the gateway sets the client identity/protocol it forwards,
+# so any inbound copy has to go first. Compared lower-cased, which is what makes a lowercase
+# `x-forwarded-for:` disappear as well (it used to survive and sit next to the trusted one).
+CLIENT_SUPPLIED = {"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-real-ip",
+                   "forwarded"}
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
     "trailers", "transfer-encoding", "upgrade", "host", "content-length",
@@ -710,6 +718,147 @@ def host_health(membership_state: str, membership_detail: str) -> dict:
 
 # --------------------------------------------------------------------------- membership
 KUBECTL = "/usr/bin/kubectl"
+
+# Kubernetes decides a pod's node ONCE, when the pod is created, and no default component ever
+# revisits that decision: remove a node and its pods are replaced elsewhere (that part works),
+# but add a node back and the running pods stay where they are - the cluster ends up with two
+# nodes full and two empty, and `topologySpreadConstraints` never gets a say because it is only
+# consulted while scheduling a NEW pod. KubeOS therefore offers one deliberate action that asks
+# each workload's own controller to replace its pods, which is the only thing that moves them.
+# It creates no Pod itself: the Deployment/StatefulSet does, exactly as when a node is removed.
+REBALANCE_ANNOTATION = "kubeos.io/rebalanced-at"
+
+# ---------------------------------------------------------------------------- the SPA watchdog
+# Headlamp's own loading state is a black screen with three dots, and when the CLUSTER API cannot
+# be reached (this node's kubeconfig points at an API server that is asleep, restarting, or was
+# never there) it stays on that screen for ever: no message, no retry, nothing to click (user,
+# 2026-11-13: "when i refresh it comes in whole screen sometimes it coming automatically").
+# The gateway already knows whether that API answers - it is what the membership probe asks - so
+# every HTML page it proxies gets this small script: it watches /kubeos-cluster-health, explains
+# the wait in KubeOS's own words, and reloads the page by itself once the API is back.
+WATCH_SNIPPET = b'<script src="/kubeos-watch.js" defer></script>'
+WATCH_JS = b"""/* KubeOS dashboard watchdog: says why the screen is empty, and reloads when it is not. */
+(function () {
+  var failures = 0;
+  var card = null;
+  var busy = false;
+
+  function build() {
+    var wrap = document.createElement('div');
+    wrap.setAttribute('data-kubeos-watch', 'overlay');
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#0b0b0b;' +
+      'display:flex;align-items:center;justify-content:center;' +
+      'font:14px/1.65 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;';
+    var box = document.createElement('div');
+    box.style.cssText = 'width:min(92vw,540px);background:#111312;border:1px solid rgba(196,255,46,.25);' +
+      'border-radius:10px;padding:26px;text-align:center;color:#e8e8e8;';
+    var brand = document.createElement('div');
+    brand.style.cssText = 'margin-bottom:18px;color:#c4ff2e;letter-spacing:.14em;font-size:15px;font-weight:700;';
+    brand.textContent = 'KUBEOS';
+    var spinner = document.createElement('div');
+    spinner.style.cssText = 'width:46px;height:46px;margin:6px auto 18px;border-radius:50%;' +
+      'border:4px solid rgba(196,255,46,.18);border-top-color:#c4ff2e;animation:kubeosspin 900ms linear infinite;';
+    var style = document.createElement('style');
+    style.textContent = '@keyframes kubeosspin{to{transform:rotate(360deg)}}';
+    var title = document.createElement('div');
+    title.style.cssText = 'font-size:16px;margin:0 0 10px;';
+    title.textContent = 'Waiting for the cluster';
+    var detail = document.createElement('div');
+    detail.setAttribute('data-kubeos-watch', 'detail');
+    detail.style.cssText = 'color:#c9cfc6;margin:8px 0;';
+    var note = document.createElement('div');
+    note.style.cssText = 'margin-top:16px;color:#8b968a;font-size:12px;border-top:1px solid #1d211c;padding-top:12px;';
+    note.textContent = 'This page reloads by itself as soon as the cluster answers again. ' +
+      'Nothing is broken and there is nothing to do.';
+    box.appendChild(brand); box.appendChild(spinner); box.appendChild(title);
+    box.appendChild(detail); box.appendChild(note);
+    wrap.appendChild(box); wrap.appendChild(style);
+    return wrap;
+  }
+
+  function show(detail) {
+    if (!card) {
+      card = build();
+      document.body.appendChild(card);
+    }
+    var line = card.querySelector('[data-kubeos-watch="detail"]');
+    if (line && detail) { line.textContent = detail; }
+  }
+
+  function check() {
+    if (busy) { return; }
+    busy = true;
+    fetch('/kubeos-cluster-health', { cache: 'no-store' })
+      .then(function (answer) { return answer.json(); })
+      .then(function (body) {
+        if (body && body.api_reachable) {
+          failures = 0;
+          if (card) { window.location.reload(); }
+          return;
+        }
+        failures += 1;
+        if (failures >= 2) {
+          show((body && body.detail) || 'the cluster API is not answering');
+        }
+      })
+      .catch(function () {
+        failures += 1;
+        if (failures >= 2) { show("this node's dashboard is not answering yet"); }
+      })
+      .then(function () { busy = false; });
+  }
+
+  window.setInterval(check, 3000);
+  check();
+}());
+"""
+
+
+
+def kubectl_run(kubeconfig: str, *args: str, timeout: int = 30) -> tuple[bool, str]:
+    """Run kubectl for its exit code only (delete/patch answer in prose, not JSON)."""
+    if not kubeconfig or not os.path.exists(kubeconfig):
+        return False, f"no kubeconfig at {kubeconfig or '(none)'}"
+    if not os.path.exists(KUBECTL):
+        return False, f"{KUBECTL} is not installed"
+    try:
+        done = subprocess.run(
+            [KUBECTL, "--kubeconfig", kubeconfig, *args,
+             "--cache-dir", "/tmp/kubeos-auth-cache"],
+            capture_output=True, text=True, timeout=timeout,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+    except (OSError, subprocess.TimeoutExpired) as reason:
+        return False, f"could not run kubectl ({reason})"
+    if done.returncode != 0:
+        return False, (done.stderr or done.stdout or "kubectl failed").strip()[:300]
+    return True, (done.stdout or "").strip()[:300]
+
+
+def kubectl_json(kubeconfig: str, *args: str, timeout: int = 20) -> tuple[bool, object, str]:
+    """Run a read-only kubectl call and parse its JSON.
+
+    HOME/--cache-dir are outside /root because the gateway unit runs with ProtectHome=yes and
+    ProtectSystem=strict (same reason the membership probe does it).
+    """
+    if not kubeconfig or not os.path.exists(kubeconfig):
+        return False, None, f"no kubeconfig at {kubeconfig or '(none)'}"
+    if not os.path.exists(KUBECTL):
+        return False, None, f"{KUBECTL} is not installed"
+    try:
+        done = subprocess.run(
+            [KUBECTL, "--kubeconfig", kubeconfig, *args,
+             "--cache-dir", "/tmp/kubeos-auth-cache"],
+            capture_output=True, text=True, timeout=timeout,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+    except (OSError, subprocess.TimeoutExpired) as reason:
+        return False, None, f"could not run kubectl ({reason})"
+    if done.returncode != 0:
+        return False, None, (done.stderr or done.stdout or "kubectl failed").strip()[:300]
+    try:
+        return True, json.loads(done.stdout or "{}"), ""
+    except ValueError as reason:
+        return False, None, f"kubectl answered something that is not JSON ({reason})"
+
 DEFAULT_KUBECONFIG = "/etc/kubeos-dashboard/kubeconfig"
 
 
@@ -950,6 +1099,10 @@ class Membership:
 class Gateway(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "kubeos-auth"
+    # ThreadingHTTPServer starts a thread per connection, so a socket that is opened and then
+    # dribbled must not be held for ever: this is the only port that answers with the login
+    # page, and a slowloris there would keep the operator out of their own node.
+    timeout = 30
 
     membership: Membership
     console_port: int = 30444
@@ -1012,8 +1165,14 @@ class Gateway(BaseHTTPRequestHandler):
                     '(on the node: <code>kubeos-trust-ca</code> prints the exact steps).')
         else:
             cert = "Certificate: this node serves a self-signed certificate (no cluster CA)."
-        return (LOGIN_PAGE.replace("__HOST__", self.hostname)
-                .replace("__USER__", user).replace("__ERROR__", error)
+        # user/error come from the posted form, so escaping them is what stops this page from
+        # reflecting markup. Measured 2026-11-13 before the fix: `user=" autofocus
+        # onfocus="alert(1)` produced a live event-handler attribute and
+        # `user="><script>alert(1)</script>` was echoed verbatim - one form post away from
+        # script running as the signed-in cluster admin, on this origin.
+        return (LOGIN_PAGE.replace("__HOST__", html.escape(self.hostname, quote=True))
+                .replace("__USER__", html.escape(user, quote=True))
+                .replace("__ERROR__", html.escape(error))
                 .replace("__CERT__", cert)).encode()
 
     def _standalone_page(self) -> bytes:
@@ -1057,6 +1216,164 @@ class Gateway(BaseHTTPRequestHandler):
             return
         connection.close()
         self._send(status, payload, content_type="application/json; charset=utf-8")
+
+    # -- rebalancing workloads onto the nodes that have room ------------------
+    def _rebalance_plan(self) -> tuple[list, list, int, str]:
+        """Compute, per workload, which pods sit on an over-full node.
+
+        WHY NOT `rollout restart`: measured on a 4-node cluster (2026-11-13), a rolling update
+        replaces pods while the old ones still exist, so the scheduler keeps seeing the crowded
+        nodes as busy and the workload ends up wherever it happened to fit - 1/2/1/0 instead of
+        1/1/1/1. Deleting ONLY the surplus pods is what moves them: the controller recreates them
+        while the crowded node's pod is gone, the scheduler's spread rules then get a say, and the
+        rest of the workload keeps running untouched.
+        """
+        conf = self.membership.kubeconfig
+        ok, nodes, error = kubectl_json(conf, "get", "nodes", "-o", "json")
+        if not ok:
+            raise RuntimeError(f"cannot list the nodes: {error}")
+        ok, pods, error = kubectl_json(conf, "get", "pods", "-A", "-o", "json")
+        if not ok:
+            raise RuntimeError(f"cannot list the pods: {error}")
+
+        eligible = []
+        for item in nodes.get("items", []):
+            meta = item.get("metadata") or {}
+            spec = item.get("spec") or {}
+            status = item.get("status") or {}
+            ready = any(cond.get("type") == "Ready" and cond.get("status") == "True"
+                        for cond in (status.get("conditions") or []))
+            taints = [t.get("effect") for t in (spec.get("taints") or [])]
+            if ready and not spec.get("unschedulable") and not (
+                    {"NoSchedule", "NoExecute"} & set(taints)):
+                eligible.append(meta.get("name") or "")
+        eligible = [name for name in eligible if name]
+
+        bare = 0
+        pods_by_owner: dict = {}
+        for pod in pods.get("items", []):
+            status = pod.get("status") or {}
+            if (status.get("phase") or "") in ("Succeeded", "Failed"):
+                continue
+            owners = (pod.get("metadata") or {}).get("ownerReferences") or []
+            if not owners:
+                bare += 1
+                continue
+            if pod.get("metadata", {}).get("deletionTimestamp"):
+                continue
+            # A Deployment's pods are owned by its ReplicaSet, so walk one level up.
+            owner = owners[0]
+            key = (owner.get("kind") or "", owner.get("name") or "", pod["metadata"].get("namespace") or "default")
+            pods_by_owner.setdefault(key, []).append(pod)
+
+        # ReplicaSet -> Deployment, so the plan can talk about workloads the user recognises.
+        rs_to_deploy: dict = {}
+        ok, sets, _ = kubectl_json(conf, "get", "replicasets", "-A", "-o", "json")
+        if ok:
+            for item in sets.get("items", []):
+                meta = item.get("metadata") or {}
+                for owner in (meta.get("ownerReferences") or []):
+                    if owner.get("kind") == "Deployment":
+                        rs_to_deploy[(meta.get("namespace") or "default", meta.get("name") or "")] = owner.get("name") or ""
+
+        workloads, plan = [], []
+        for resource, kind in (("deployments", "Deployment"), ("statefulsets", "StatefulSet")):
+            ok, listing, _ = kubectl_json(conf, "get", resource, "-A", "-o", "json")
+            if not ok:
+                continue
+            for item in listing.get("items", []):
+                meta = item.get("metadata") or {}
+                spec = item.get("spec") or {}
+                status = item.get("status") or {}
+                replicas = int(spec.get("replicas") or 0)
+                if replicas <= 0:
+                    continue
+                namespace = meta.get("namespace") or "default"
+                name = meta.get("name") or ""
+                owned = pods_by_owner.get((kind, name, namespace), [])
+                if kind == "Deployment":
+                    owned = []
+                    for (owner_kind, owner_name, owner_ns), owned_pods in pods_by_owner.items():
+                        if owner_kind == "ReplicaSet" and owner_ns == namespace and \
+                                rs_to_deploy.get((namespace, owner_name)) == name:
+                            owned.extend(owned_pods)
+                placement: dict = {}
+                for pod in owned:
+                    node = (pod.get("spec") or {}).get("nodeName") or ""
+                    if node:
+                        placement[node] = placement.get(node, 0) + 1
+                # Target: as even as possible over the nodes that can take pods.
+                targets: dict = {}
+                if eligible:
+                    base, extra = divmod(replicas, len(eligible))
+                    ordered = sorted(eligible, key=lambda n: (-placement.get(n, 0), n))
+                    for index, node in enumerate(ordered):
+                        targets[node] = base + (1 if index < extra else 0)
+                # Keep up to `allowed` pods where they are and move the rest; documents what the
+                # user sees in the preview ("2 pods will move off kubeos1").
+                moves = []
+                for node, count in placement.items():
+                    allowed = targets.get(node, count)
+                    if count <= allowed:
+                        continue
+                    on_node = [pod for pod in owned
+                               if (pod.get("spec") or {}).get("nodeName") == node]
+                    moves.extend(on_node[allowed:])
+                workloads.append({"kind": kind, "namespace": namespace, "name": name,
+                                  "replicas": replicas,
+                                  "ready": int(status.get("readyReplicas") or 0),
+                                  "placement": placement,
+                                  "would_move": len(moves)})
+                for pod in moves:
+                    plan.append((namespace, pod.get("metadata", {}).get("name") or "", kind, name))
+        return workloads, plan, bare, ""
+
+    def _rebalance_preview(self) -> None:
+        try:
+            workloads, plan, bare, _ = self._rebalance_plan()
+        except RuntimeError as reason:
+            self._send_json(503, {"ok": False, "error": str(reason)})
+            return
+        self._send_json(200, {"ok": True, "annotation": REBALANCE_ANNOTATION,
+                              "workloads": workloads, "would_move": len(plan),
+                              "bare_pods": bare})
+        return
+
+    def _rebalance_apply(self) -> None:
+        """Delete ONLY the pods sitting on over-full nodes; their controller recreates them.
+
+        Nothing is created here: the workload's own controller makes the replacement, exactly as
+        it does when a node is removed. The pods left alone never restart.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            host = (self.headers.get("Host") or "").strip()
+            if host and origin not in (f"https://{host}", f"http://{host}"):
+                # The session cookie would otherwise let any page on the internet move the user's
+                # pods with a form post.
+                self._send_json(403, {"ok": False, "error": "cross-origin request refused"})
+                return
+        try:
+            workloads, plan, bare, _ = self._rebalance_plan()
+        except RuntimeError as reason:
+            self._send_json(503, {"ok": False, "error": str(reason)})
+            return
+        conf = self.membership.kubeconfig
+        moved, failed = [], []
+        for namespace, pod_name, kind, workload in plan:
+            ok, error = kubectl_run(
+                conf, "-n", namespace, "delete", "pod", pod_name,
+                "--grace-period=1", "--wait=false", timeout=30)
+            entry = {"namespace": namespace, "pod": pod_name,
+                     "workload": f"{kind}/{workload}"}
+            if ok:
+                moved.append(entry)
+            else:
+                failed.append({**entry, "error": error})
+        log(f"{self.client_address[0]} rebalanced: deleting {len(moved)} pod(s), "
+            f"{len(failed)} failure(s)")
+        self._send_json(200, {"ok": True, "moved": moved, "failed": failed,
+                              "bare_pods": bare, "workloads": workloads})
 
     def _standalone(self, path: str) -> None:
         """The detached machine's own view: itself, and a way back into a cluster."""
@@ -1104,17 +1421,26 @@ class Gateway(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 
-    def _rate_limited(self) -> bool:
+    def _failure_count(self) -> int:
+        """Wrong passwords from this address inside the window (prunes while it counts)."""
         now = time.time()
         address = self.client_address[0]
         with self.failures_lock:
             hits = [t for t in self.failures.get(address, []) if now - t < FAIL_WINDOW]
-            self.failures[address] = hits
-            return len(hits) >= FAIL_LIMIT
+            if hits:
+                self.failures[address] = hits
+            else:
+                # Do not keep an address (personal data) for a client that stopped trying.
+                self.failures.pop(address, None)
+            return len(hits)
 
     def _record_failure(self) -> None:
         with self.failures_lock:
             self.failures.setdefault(self.client_address[0], []).append(time.time())
+
+    def _clear_failures(self) -> None:
+        with self.failures_lock:
+            self.failures.pop(self.client_address[0], None)
 
     # -- login / logout ----------------------------------------------------------
     def _handle_login(self) -> None:
@@ -1125,16 +1451,28 @@ class Gateway(BaseHTTPRequestHandler):
         fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         user = (fields.get("user") or [""])[0].strip()
         password = (fields.get("password") or [""])[0]
-        if self._rate_limited():
-            log(f"{self.client_address[0]} refused: too many failed logins")
+        # THE RATE LIMIT MUST NEVER REFUSE THE CORRECT PASSWORD. It used to run before the
+        # password was verified, so five wrong guesses from one address locked the real admin
+        # out for five minutes - and any stranger who could reach :30443 could do that on
+        # demand (measured 2026-11-13: five 401s, then 429 - including for the correct
+        # password). Now 429 answers WRONG passwords only, and a hard cap stops the password
+        # check itself from being used as a CPU lever.
+        failures = self._failure_count()
+        if failures >= FAIL_HARD_LIMIT:
+            log(f"{self.client_address[0]} refused: {failures} failed logins, not verifying")
             self._send(429, self._login_page("Too many attempts - wait a few minutes."),
                        extra=[("Retry-After", "300")])
             return
         if not password_ok(user, password):
             self._record_failure()
             log(f"{self.client_address[0]} refused: bad password for {user or '(no user)'}")
-            self._send(401, self._login_page("Wrong user or password.", user=user or "root"))
+            if failures + 1 >= FAIL_LIMIT:
+                self._send(429, self._login_page("Too many attempts - wait a few minutes."),
+                           extra=[("Retry-After", "300")])
+            else:
+                self._send(401, self._login_page("Wrong user or password.", user=user or "root"))
             return
+        self._clear_failures()
         cookie = (f"{SESSION_COOKIE}={self.sessions.issue(user)}; Path=/; HttpOnly; Secure; "
                   f"SameSite=Strict; Max-Age={int(self.sessions.ttl)}")
         log(f"{self.client_address[0]} signed in as {user}")
@@ -1166,7 +1504,15 @@ class Gateway(BaseHTTPRequestHandler):
 
     def _proxy(self) -> None:
         body = None
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, b"bad Content-Length\n", content_type="text/plain; charset=utf-8")
+            return
+        if length > MAX_BODY:
+            self._send(413, b"request body too large\n",
+                       content_type="text/plain; charset=utf-8")
+            return
         if length > 0:
             body = self.rfile.read(length)
 
@@ -1174,7 +1520,8 @@ class Gateway(BaseHTTPRequestHandler):
             self._proxy_websocket()
             return
 
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_SUPPLIED}
         headers["Host"] = f"127.0.0.1:{self.upstream_port}"
         headers["X-Forwarded-For"] = self.client_address[0]
         headers["X-Forwarded-Proto"] = "https"
@@ -1186,6 +1533,31 @@ class Gateway(BaseHTTPRequestHandler):
         except OSError as reason:
             connection.close()
             self._busy(str(reason))
+            return
+
+        # Every HTML page from Headlamp gets the watchdog. Buffered on purpose: the body is the
+        # SPA's index (a few KB), and a Content-Length that is off by the injected script's length
+        # would truncate the page instead of fixing it.
+        content_type = (response.getheader("Content-Type") or "").lower()
+        if (self.command == "GET" and "text/html" in content_type
+                and not self._is_websocket()):
+            raw = response.read()
+            connection.close()
+            if WATCH_SNIPPET not in raw:
+                if b"</body>" in raw:
+                    raw = raw.replace(b"</body>", WATCH_SNIPPET + b"</body>", 1)
+                else:
+                    raw = raw + WATCH_SNIPPET
+            self.send_response(response.status, response.reason)
+            for key, value in response.getheaders():
+                lower = key.lower()
+                if lower in HOP_BY_HOP or lower == "content-length":
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            self.wfile.flush()
             return
 
         self.send_response(response.status, response.reason)
@@ -1302,6 +1674,29 @@ class Gateway(BaseHTTPRequestHandler):
             self._send_json(200, host_health(state, detail))
             return
 
+        if path == "/kubeos-watch.js":
+            self._send(200, WATCH_JS, content_type="application/javascript; charset=utf-8")
+            return
+
+        if path == "/kubeos-cluster-health":
+            state, detail = self.membership.snapshot()
+            # "member" is exactly what the probe says after asking THIS node's API server for this
+            # node's own object: an answer means the cluster is reachable from here.
+            reachable = state == "member"
+            self._send_json(200, {"ok": True, "api_reachable": reachable,
+                                  "state": state,
+                                  "detail": "" if reachable else
+                                  (detail or "the cluster API is not answering")})
+            return
+
+        if path == "/kubeos-rebalance":
+            # Behind the login gate on purpose: this restarts the user's workloads.
+            if self.command in ("POST", "PUT"):
+                self._rebalance_apply()
+            else:
+                self._rebalance_preview()
+            return
+
         if path.startswith("/kubeos-standalone"):
             self._standalone(path)
             return
@@ -1317,8 +1712,9 @@ class Gateway(BaseHTTPRequestHandler):
             wants_html = "text/html" in (self.headers.get("Accept") or "") or path == "/"
             if self.command in ("GET", "HEAD") and wants_html:
                 step = join_detail or "waiting for the join to finish"
-                self._send(200, (JOINING_PAGE.replace("__HOST__", self.hostname)
-                                 .replace("__STEP__", step)).encode())
+                # journal-derived text: escaped for the same reason as the login page
+                self._send(200, (JOINING_PAGE.replace("__HOST__", html.escape(self.hostname, quote=True))
+                                 .replace("__STEP__", html.escape(step))).encode())
             else:
                 self._send_json(503, {"state": "joining",
                                       "error": "this machine is joining a cluster",

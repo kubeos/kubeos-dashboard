@@ -35,6 +35,7 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import React from 'react';
 import { BRAND } from './brand';
+import { ConsoleConfig, consoleConfig, consoleFetch, consoleJson } from './consoleapi';
 
 const NAMESPACE = 'kubeos-system';
 const CONFIGMAP = 'kubeos-disks';
@@ -392,30 +393,24 @@ function NoReport() {
 /* ---- creating LVM objects from the dashboard ----------------------------- */
 
 /**
- * The dashboard pod cannot run `vgcreate` — LVM only exists on the node. So KubeOS
- * does what "Join node" already does: it starts a one-shot privileged Job pinned
- * to this node (host root at /host, host namespaces through `nsenter -t 1`), the
- * Job creates the object, and then it pokes kubeos-disks-report.service so the
- * ConfigMap — and therefore this page — shows the result straight away.
+ * LVM lives on the node, not in the dashboard, so this asks the node's own console service -
+ * the same root service that runs Restart, Power off and Shell. It deliberately does NOT
+ * create a Pod/Job: a storage click must leave nothing in the cluster (KubeOS rule, 2026-11-12),
+ * and the privileged Job this replaced also needed pods/jobs create permission and could be
+ * stranded by a shutdown.
  *
- * SECURITY, stated plainly: this is the only write path in the dashboard, and it
- * runs commands as root on the node. Every value that reaches the shell is
- * validated against a strict pattern first (NAME/DEVICE/SIZE below), so a name
- * typed into the dialog can never become shell syntax. It also means the dashboard
- * needs permission to create Jobs in kubeos-system; on a real cluster that is a
- * permission to grant deliberately, not cluster-admin.
+ * SECURITY, stated plainly: `kubeos-console` is root on this node by design, so this reaches
+ * the same power the Job had, minus the object. Every value the dialog can send is validated
+ * twice - here for a useful message, and again on the node before any command runs (name
+ * pattern, real whole disk, not mounted, not already a PV, size with a unit). The console runs
+ * lvm as an argv list, never through a shell.
  */
-const HELPER_IMAGE = 'ghcr.io/skmdab/kubeos-join-helper:0.1.0';
-const REPORT_UNIT = 'kubeos-disks-report.service';
-
 /** lvm rejects a leading '-' and anything outside this set. */
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9+_.-]{0,126}$/;
 /** A whole disk exactly as lsblk names it, e.g. /dev/vdb. */
 const DEVICE_PATTERN = /^\/dev\/[a-z]+[a-z0-9]*$/;
 /** lvcreate -L size: a number with a unit, e.g. 8g / 512m / 1.5g. */
 const SIZE_PATTERN = /^[0-9]{1,6}(?:\.[0-9]{1,3})?[mMgGtT]$/;
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 type CreateRequest =
   | { kind: 'vg'; device: string; name: string }
@@ -436,7 +431,7 @@ function freeDisks(disks: Disks | null): BlockDevice[] {
       if (pv) {
         // A PV that belongs to a volume group is in use. An *orphan* PV (an LVM label
         // with no group, left behind by an earlier install) is free space in practice:
-        // `pvcreate -ff` in hostScript() overwrites the label before vgcreate.
+        // the console overwrites the label with `pvcreate -ff`.
         return !pv.vg_name;
       }
       return !device.fstype;
@@ -450,83 +445,27 @@ function hasOrphanPv(disks: Disks | null, device: BlockDevice): boolean {
   );
 }
 
-/** The shell the Job runs on the host. Values are pre-validated (see above). */
-function hostScript(request: CreateRequest): string {
-  const host = 'nsenter -t 1 -m -u -i -n -p --';
-  const refresh = `${host} systemctl start ${REPORT_UNIT} >/dev/null 2>&1 || true`;
-  if (request.kind === 'vg') {
-    return [
-      'set -e',
-      `echo 'creating volume group ${request.name} on ${request.device}'`,
-      `${host} pvcreate -ff -y '${request.device}'`,
-      `${host} vgcreate '${request.name}' '${request.device}'`,
-      `${host} vgs '${request.name}'`,
-      refresh,
-    ].join('\n');
+/** Ask the node's console to create the object. Throws with the node's own message. */
+async function createLvmObject(config: ConsoleConfig, request: CreateRequest): Promise<string> {
+  const body =
+    request.kind === 'vg'
+      ? { action: 'vgcreate', name: request.name, device: request.device }
+      : {
+          action: 'thinpool',
+          name: request.name,
+          volumeGroup: request.volumeGroup,
+          size: request.size,
+        };
+  const answer = await consoleFetch(config, '/action/lvm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const parsed = await consoleJson<any>(answer);
+  if (!answer.ok || parsed?.ok === false) {
+    throw new Error(String(parsed?.error ?? `the console answered ${answer.status}`));
   }
-  const size = request.size ? `-L '${request.size}'` : '-l 100%FREE';
-  return [
-    'set -e',
-    `echo 'creating thin pool ${request.name} in ${request.volumeGroup}'`,
-    `${host} lvcreate --type thin-pool ${size} -n '${request.name}' '${request.volumeGroup}'`,
-    `${host} lvs -a '${request.volumeGroup}'`,
-    refresh,
-  ].join('\n');
-}
-
-async function startCreateJob(request: CreateRequest): Promise<string> {
-  const suffix = Math.random().toString(36).slice(2, 8);
-  const jobName = `kubeos-lvm-${request.kind}-${suffix}`;
-  const labels = { 'kubeos.io/storage-create': request.kind };
-  const job = {
-    apiVersion: 'batch/v1',
-    kind: 'Job',
-    metadata: { name: jobName, namespace: NAMESPACE, labels },
-    spec: {
-      backoffLimit: 0,
-      ttlSecondsAfterFinished: 600,
-      template: {
-        metadata: { labels },
-        spec: {
-          restartPolicy: 'Never',
-          hostPID: true,
-          tolerations: [{ operator: 'Exists' }],
-          containers: [
-            {
-              name: 'storage-create',
-              image: HELPER_IMAGE,
-              imagePullPolicy: 'IfNotPresent',
-              securityContext: { privileged: true },
-              volumeMounts: [{ name: 'host', mountPath: '/host' }],
-              command: ['/bin/sh', '-c', hostScript(request)],
-            },
-          ],
-          volumes: [{ name: 'host', hostPath: { path: '/' } }],
-        },
-      },
-    },
-  };
-  await ApiProxy.post(`/apis/batch/v1/namespaces/${NAMESPACE}/jobs`, job);
-  return jobName;
-}
-
-/** Wait for the Job to finish. Returns null on success, else the failure reason. */
-async function waitForJob(jobName: string): Promise<string | null> {
-  for (let attempt = 0; attempt < 60; attempt++) {
-    await sleep(2000);
-    const job: any = await ApiProxy.request(
-      `/apis/batch/v1/namespaces/${NAMESPACE}/jobs/${jobName}`
-    );
-    const status = job?.status ?? {};
-    if ((status.succeeded ?? 0) > 0) {
-      return null;
-    }
-    if ((status.failed ?? 0) > 0) {
-      const condition = (status.conditions ?? []).find((entry: any) => entry.type === 'Failed');
-      return condition?.message ?? 'the job failed';
-    }
-  }
-  return 'the job did not finish within two minutes';
+  return String(parsed?.detail ?? 'created');
 }
 
 const dialogNote = { display: 'block', mb: 2, color: BRAND.text.muted } as const;
@@ -565,14 +504,8 @@ function CreateVolumeGroupDialog({
     setBusy(true);
     setError(null);
     try {
-      const jobName = await startCreateJob({ kind: 'vg', device, name });
-      const failure = await waitForJob(jobName);
-      if (failure) {
-        setError(
-          `Could not create the volume group: ${failure} (job ${jobName}; its pod log has the output)`
-        );
-        return;
-      }
+      const config = await consoleConfig();
+      await createLvmObject(config, { kind: 'vg', device, name });
       onCreated();
       onClose();
     } catch (reason: any) {
@@ -688,14 +621,8 @@ function CreateThinPoolDialog({
     setBusy(true);
     setError(null);
     try {
-      const jobName = await startCreateJob({ kind: 'thin', volumeGroup, name, size });
-      const failure = await waitForJob(jobName);
-      if (failure) {
-        setError(
-          `Could not create the thin pool: ${failure} (job ${jobName}; its pod log has the output)`
-        );
-        return;
-      }
+      const config = await consoleConfig();
+      await createLvmObject(config, { kind: 'thin', volumeGroup, name, size });
       onCreated();
       onClose();
     } catch (reason: any) {

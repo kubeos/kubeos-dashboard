@@ -29,6 +29,9 @@ import "./nodeactions";
 import "./nodehealth";
 // The etcd snapshots page: take/list/download backups through the node's own console.
 import "./snapshots";
+// The "Rebalance" page: move pods off over-full nodes onto the ones with room.
+// Kubernetes never moves a running pod by itself, so this is a deliberate action.
+import "./rebalance";
 import { kubeosTheme } from "./theme";
 
 /**
@@ -83,7 +86,7 @@ function KubeOSLogo({ logoType = "large", className }: AppLogoProps) {
  *
  * `productName` itself comes from a build-time env var
  * (REACT_APP_HEADLAMP_PRODUCT_NAME), which only a frontend rebuild can change.
- * We deliberately do not rebuild the frontend (see image/Dockerfile), so the
+ * We deliberately do not rebuild the frontend (it is the vendored upstream bundle), so the
  * DOM is the only lever a plugin has. Cost of that choice: the About/version
  * strings still say Headlamp.
  */

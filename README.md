@@ -6,12 +6,14 @@ This repository holds only the KubeOS-specific layer:
 
 | Path | What it is |
 |---|---|
-| `kubeos-branding/` | Headlamp plugin: the KubeOS theme, logo, page title and favicon |
-| `image/Dockerfile` | one-layer image on the official Headlamp image |
-| `deploy/values.yaml` | Helm values: NodePort 30443, TLS, plugin manager off |
+| `kubeos/` | Headlamp plugin: KubeOS theme, logo, title, node actions and the KubeOS pages |
+| `deploy/binary/` | the host release: gateway, console, installer, `kubeos-trust-ca` |
+| `vendor/headlamp/` | upstream's server binary and frontend, vendored by digest |
 
-Nothing here modifies Headlamp itself. The upstream image, binary and frontend
-bundle are used exactly as published.
+Nothing here modifies Headlamp itself. The upstream binary and frontend bundle are
+used exactly as published. KubeOS delivers the dashboard as a **host service** (a
+static binary + systemd units), because a KubeOS node runs its control plane as host
+services and keeps no base Pods.
 
 ## Branches
 
@@ -30,8 +32,7 @@ Kubernetes project, or the Headlamp maintainers. See `NOTICE`.
 
 | Component | Pinned to | Why |
 |---|---|---|
-| Headlamp image | `v0.46.0` | `ARG HEADLAMP_VERSION` in `image/Dockerfile` |
-| Helm chart | `0.46.0` | `--version` on `helm upgrade`; chart default image tag is derived from `appVersion` |
+| Headlamp server binary + frontend | `v0.46.0` | `HEADLAMP_VERSION` in `deploy/binary/build-binary.sh`, verified by layer digest |
 | Plugin SDK | `@kinvolk/headlamp-plugin` `^0.14.0` | the release paired with Headlamp 0.46 |
 
 Bump them in one commit, then re-check that the theme still applies.
@@ -39,12 +40,11 @@ Bump them in one commit, then re-check that the theme still applies.
 ## Build
 
 ```sh
-cd kubeos-branding
+cd kubeos
 npm install
-npm run build            # -> kubeos-branding/dist/{main.js,package.json}
-
-cd ..
-docker build -f image/Dockerfile -t ghcr.io/skmdab/headlamp:kubeos-0.1.0 .
+npm run build            # -> kubeos/dist/{main.js,package.json}
+cd -
+deploy/binary/build-binary.sh   # -> release/kubeos-dashboard-<v>-linux-amd64.tar.gz
 ```
 
 The plugin bundle is built once and committed, because the machine that builds
@@ -61,7 +61,7 @@ no Pod. This is the form KubeOS itself uses, because the node runs its control p
 host services and keeps no base Pods.
 
 ```sh
-cd kubeos-branding && npm run build && cd -   # rebuild the plugin (it is committed)
+cd kubeos && npm run build && cd -   # rebuild the plugin (it is committed)
 deploy/binary/build-binary.sh                 # -> release/kubeos-dashboard-<v>-linux-amd64.tar.gz
 ```
 

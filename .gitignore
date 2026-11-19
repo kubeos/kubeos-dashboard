@@ -21,3 +21,5 @@ debian/*.substvars
 debian/.debhelper/
 debian/debhelper-build-stamp
 debian/kubeos-dashboard/
+__pycache__/
+debian/*.debhelper.log

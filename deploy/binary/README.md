@@ -7,7 +7,7 @@ everything needed to produce and install that form of it.
 ## Build the release
 
 ```sh
-cd kubeos-branding && npm run build && cd -   # only if src/ changed: dist/ is committed
+cd kubeos && npm run build && cd -   # only if src/ changed: dist/ is committed
 deploy/binary/build-binary.sh
 ```
 
@@ -22,7 +22,7 @@ working dashboard with no docker, no Go, no Node, no registry account and no `gh
 A single modified byte in a vendored file stops the build with the expected and actual
 digest (`vendor/README.md` explains the provenance and the licence).
 
-The plugin bundle (`kubeos-branding/dist/main.js`) is committed for the same reason, so
+The plugin bundle (`kubeos/dist/main.js`) is committed for the same reason, so
 the only optional dependency left, and only when you edit the TypeScript, is `npm`.
 
 Why not compile it ourselves: upstream Headlamp needs Go 1.26, and upstream publishes no
