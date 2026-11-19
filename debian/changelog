@@ -1,11 +1,6 @@
-kubeos-dashboard (0.1.0-1kubeos2) trixie; urgency=medium
 
-  * Rebuild with the plugin published as id "kubeos" again. The 1kubeos1 package
-    shipped it as "kubeos-branding": Headlamp enables plugins per id, so a browser
-    that had enabled the KubeOS plugin in an earlier install stopped loading it and
-    the KubeOS pages disappeared on a freshly installed node. Code unchanged.
 
- -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 19:20:00 +0530
+ d5b995c (feat: ship the verified release archive, do not rebuild it)
 
 kubeos-dashboard (0.1.0-1kubeos1) trixie; urgency=medium
 

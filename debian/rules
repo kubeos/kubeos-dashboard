@@ -1,24 +1,26 @@
 #!/usr/bin/make -f
-# KubeOS dashboard packaging: the payload is the repository's own release archive.
+# KubeOS dashboard packaging.
+#
+# WHY  package the RELEASE ARCHIVE instead of rebuilding it: this is the exact artefact that is
+#      booted and verified in the ISO, so what the package ships and what was tested are the same
+#      bytes by construction. Building it here from source instead meant trusting a branch - and on
+#      2026-11-19 that shipped the `main` branch, which is behind `dev`, silently dropping the
+#      rebalance feature and the etcd-snapshot fix.
 %:
 	dh $@
 
-# Build the release the same way a human does, offline from vendor/ - no registry, no npm.
 override_dh_auto_build:
-	sh deploy/binary/build-binary.sh
+	@echo "kubeos-dashboard: shipping vendor/release, nothing is rebuilt"
 
-# Install it exactly where the ISO put it: kubeos-dashboard-install (in kubeos-cli) reads
-# RELEASE, verifies SHA256 and unpacks the tarball into this directory. Keeping that layout
-# means the first-boot path needs no change at all.
+# The payload goes exactly where the ISO put it: kubeos-dashboard-install (in kubeos-cli) reads
+# RELEASE, verifies SHA256 and unpacks the tarball into this directory.
 override_dh_auto_install:
 	install -d -m 0755 debian/kubeos-dashboard/usr/share/kubeos/dashboard
-	set -e; tarball=$$(ls release/kubeos-dashboard-*-linux-amd64.tar.gz | head -n 1); \
-	  name=$$(basename "$$tarball" .tar.gz); \
-	  install -m 0644 "$$tarball" debian/kubeos-dashboard/usr/share/kubeos/dashboard/; \
-	  echo "$$name" > debian/kubeos-dashboard/usr/share/kubeos/dashboard/RELEASE; \
-	  ( cd release && sha256sum "$$name.tar.gz" ) > debian/kubeos-dashboard/usr/share/kubeos/dashboard/SHA256
-	chmod 0644 debian/kubeos-dashboard/usr/share/kubeos/dashboard/RELEASE \
-	           debian/kubeos-dashboard/usr/share/kubeos/dashboard/SHA256
+	install -m 0644 vendor/release/*.tar.gz debian/kubeos-dashboard/usr/share/kubeos/dashboard/
+	install -m 0644 vendor/release/RELEASE   debian/kubeos-dashboard/usr/share/kubeos/dashboard/RELEASE
+	install -m 0644 vendor/release/SHA256    debian/kubeos-dashboard/usr/share/kubeos/dashboard/SHA256
+	# prove at build time that the artefact matches the checksum shipped next to it
+	set -e; cd debian/kubeos-dashboard/usr/share/kubeos/dashboard && sha256sum -c SHA256
 
 # Nothing under /etc: no conffiles (D5).
 override_dh_installdeb:
