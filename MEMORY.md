@@ -2063,3 +2063,9 @@ Screenshots: `multi-node-control.png`, `multi-node-worker.png`.
   left untracked: the user's `autherror.png` and the dead `src/nodesview.tsx` (never referenced from `index.tsx`; removing
   it needs their word). The release tarball stays ignored (`/release/` in .gitignore) - it is build output, 50 MB
   compressed / 123 MB unpacked.
+
+- 2026-11-19 (join-string contract, no dashboard change): a node's Join box consumes `KOSJOIN1.`; the minting
+  half is `kubeos-branding/src/addnode.tsx`, whose `endpoint` is `rawEndpoint.replace(/^https?:\/\//, '')` - i.e.
+  **host:port, no scheme**, because it is handed straight to `kubeadm join`, which rejects a URL (`too many colons in
+  address`). Confirmed on kubeos2: with a bare endpoint the join, the kube-proxy identity and the DNS DNAT
+  (`kube-dns:dns -> 192.168.122.5:53`) all came out right. The dashboard code was already correct and was not touched.
