@@ -2225,3 +2225,14 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   from `dev` did not silently drop anything, which is the mistake that cost us the rebalance
   feature on 2026-11-19. Nothing pushed to GitHub; the working branch is still `dev` (`c79e7cb`
   plus these changes) and `main` does not carry them yet.
+
+- 2026-11-20 08:15 — **`dev` is merged into `main` and both are pushed.** `dev` = `248e7f0`,
+  merge commit `main` = `0ee6c44`, verified after the merge that `QuietServer` is present in `main`'s
+  `deploy/binary/authproxy.py` — the branch the package is built from can no longer produce the
+  0.1.0-5 gateway. The release rule therefore holds as documented ("develop on `dev`, release by
+  merging `dev` into `main`, the package is built from `main`"), and the trap of 2026-11-19 (shipping
+  from a stale branch) is closed for this release. `kubeos-cli` `main` was pushed in the same turn
+  (`487d977`) because the join script that is running lives in the ISO tree's `.pkg-staging/`, which
+  KubeOS excludes from its own repo. Note for pushes from this host: the sandbox exposes
+  `/etc/ssh/ssh_config.d` as owned by `nobody`, so ssh refuses its own system config and `git push`
+  fails with "Bad owner or permissions" until git is told `-c core.sshCommand='ssh -F none'`.
