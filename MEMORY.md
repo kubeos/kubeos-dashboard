@@ -2280,3 +2280,13 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   lintian reports `latest-changelog-entry-without-new-date`; backdating a changelog line to silence it would be a lie.
   Remember the wrapper's idempotency rule when testing: it skips a re-run when the payload sha matches
   `/var/lib/kubeos/dashboard.payload.sha256`, so "same release again" legitimately prints "already installed".
+  **Pushed 2026-11-20 21:47** (user approved): `dev` = `c18970c`, merged into `main` = `9787b52` (this repo's
+  convention: `main` carries merge commits, so a push of `dev:main` is rejected as non-fast-forward — merge, never
+  force). Both trees verified identical after the merge.
+
+- 2026-11-20 22:25 — the node now runs a host firewall (`kubeos-firewall`, nftables, INPUT default-deny). It
+  matters here for two reasons: the dashboard (30443) and the console (30444) are inside the NodePort range
+  30000-32767, so both are allowed explicitly AND by the NodePort rule — a rule that blocks "the dashboard port"
+  will not block 30443, which is worth remembering when testing firewall changes against this product; and the
+  console's WebSocket (`wss://<node>:30444`) is unaffected because established traffic and that port are open.
+  Verified after the change: dashboard 200, console 200, agent unaffected.
