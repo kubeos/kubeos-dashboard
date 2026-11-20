@@ -2236,3 +2236,11 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   KubeOS excludes from its own repo. Note for pushes from this host: the sandbox exposes
   `/etc/ssh/ssh_config.d` as owned by `nobody`, so ssh refuses its own system config and `git push`
   fails with "Bad owner or permissions" until git is told `-c core.sshCommand='ssh -F none'`.
+
+- 2026-11-20 08:35 — no code change here; a documentation-accuracy pass in the other two repos is recorded for
+  completeness, because it touches the same cluster story the dashboard reports. The KubeOS user guide and the website
+  both claimed that local volumes "follow the pod", which is backwards: a `local-path` volume is stamped with one node
+  and the pod is pinned there (scheduler: `1 node(s) didn't match PersistentVolume's node affinity`), so a stateful pod
+  whose node is removed waits in `Pending` instead of moving. Both copies now say that, and the ISO's `AGENTS.md` smoke
+  test no longer asks for `crictl` (removed with `cri-tools` on 2026-11-13). When a docs fix ships through Cloudflare
+  Pages, verify the live page after the build — the first fetch a minute after the push still served the old sentence.
