@@ -2252,3 +2252,31 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   from the cluster, standalone rebuild triggered after the 120 s window, `member` again after the re-join. No dashboard
   code changed in this round; the round's bug was in `kubeos-storage` (a removed node's standalone rebuild deleted the
   old cluster's PV directories), which the dashboard surfaced only as a workload that came back with an empty volume.
+
+- 2026-11-20 20:55 — **two defects found by using the dashboard, both shipped as 0.1.0-10.** (1) Deleting an etcd
+  snapshot could never work in a browser: the page issues HTTP `DELETE`, but the console's CORS preflight advertised
+  only `POST, PUT, GET, OPTIONS`, so the browser refused to send it — `Failed to fetch` on the page and **no request
+  at all** in `kubeos-console`'s journal, while the same call from curl (which ignores CORS) deleted the file
+  perfectly. `DELETE` is now in `Access-Control-Allow-Methods`. The lesson is the diagnostic order: when a page says
+  "Failed to fetch", check whether the server ever saw the request — if it did not, suspect CORS/TLS before the API.
+  (2) `apt upgrade kubeos-dashboard` moved the package version but the node kept running the previous release: the
+  package only ships the tarball, and unpacking it is done by `kubeos-dashboard-install.service` (kubeos-cli), a
+  oneshot with `RemainAfterExit=yes` that answers "active (exited)" for ever, so a bare `systemctl start` is a no-op.
+  The package now ships a postinst that stops, `reset-failed`s and starts that unit (warn-only). A third, self-
+  inflicted lesson: the dashboard build sync copied a NAMED list of files, so `debian/postinst` never reached the
+  builder and 0.1.0-8 shipped without it — the sync now copies the whole `debian/` directory and the build asserts the
+  script is inside the package.
+
+- 2026-11-20 21:40 — **0.1.0-11: the dashboard now really upgrades on a WORKER, and the deploy is provable by content.**
+  The package's own postinst was not enough: it starts `kubeos-dashboard-install.service`, and that installer (in
+  `kubeos-cli`) required `/etc/kubernetes/admin.conf`, which a joined worker does not have — so on kubeos2/kubeos3
+  `apt upgrade kubeos-dashboard` moved the version and kept the OLD console/plugin running until the node was
+  re-joined. The fix is on the `kubeos-cli` side (OR-ed unit conditions + fallback to
+  `/etc/kubeos-dashboard/kubeconfig`), and this release carries the other half: a `KubeOS deploy marker` line in
+  `console.py`, so an upgrade can be proven by CONTENT (grep the deployed `/usr/lib/kubeos-console/console.py`)
+  instead of a timestamp. Measured on 192.168.122.5: 0.1.0-9 → 0.1.0-11 by `apt install` alone put the marker in the
+  deployed file and left `kubeos-dashboard`, `kubeos-dashboard-auth` and `kubeos-console` active, `https` 200.
+  Also added `debian/kubeos-dashboard.lintian-overrides`: 0.1.0-9 and 0.1.0-10 were both uploaded on 2026-11-20, so
+  lintian reports `latest-changelog-entry-without-new-date`; backdating a changelog line to silence it would be a lie.
+  Remember the wrapper's idempotency rule when testing: it skips a re-run when the payload sha matches
+  `/var/lib/kubeos/dashboard.payload.sha256`, so "same release again" legitimately prints "already installed".

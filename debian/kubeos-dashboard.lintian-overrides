@@ -1,0 +1,5 @@
+# 0.1.0-9 and 0.1.0-10 were both uploaded on 2026-11-20 (the second fixes the first's missing
+# postinst), so the newest changelog entry shares a date with the one below it. The rule exists to
+# catch a maintainer who forgot to change the date when adding an entry; here the date IS correct
+# and backdating it to satisfy the checker would be worse than the warning.
+kubeos-dashboard: latest-changelog-entry-without-new-date [usr/share/doc/kubeos-dashboard/changelog.Debian.gz:1]
