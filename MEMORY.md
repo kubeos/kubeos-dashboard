@@ -2244,3 +2244,11 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   whose node is removed waits in `Pending` instead of moving. Both copies now say that, and the ISO's `AGENTS.md` smoke
   test no longer asks for `crictl` (removed with `cri-tools` on 2026-11-13). When a docs fix ships through Cloudflare
   Pages, verify the live page after the build — the first fetch a minute after the push still served the old sentence.
+
+- 2026-11-20 09:45 — dashboard re-verified on a freshly reinstalled three-node cluster (kubeos-dashboard 0.1.0-6, the
+  release carrying the `QuietServer` fix): login answers 303 → the KubeOS shell page on both a control plane and a
+  worker, wrong password still 401, HSTS + CSP + nosniff present on every response, and the membership probe behaved
+  correctly across the whole sequence - `member` while joined, `member -> detached` seconds after the node was deleted
+  from the cluster, standalone rebuild triggered after the 120 s window, `member` again after the re-join. No dashboard
+  code changed in this round; the round's bug was in `kubeos-storage` (a removed node's standalone rebuild deleted the
+  old cluster's PV directories), which the dashboard surfaced only as a workload that came back with an empty volume.
