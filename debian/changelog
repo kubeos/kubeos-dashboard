@@ -1,3 +1,55 @@
+kubeos-dashboard (0.1.0-11) trixie; urgency=medium
+
+  * Silence one real lintian error honestly instead of renaming a date. 0.1.0-9 and 0.1.0-10 were
+    both uploaded on 2026-11-20, so the newest changelog entry carries the same date as the one
+    below it and lintian reports latest-changelog-entry-without-new-date - a packaging rule about
+    the date line, not about this package. Backdating an entry to hide it would be a lie, so
+    debian/kubeos-dashboard.lintian-overrides documents it instead.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 22:20:00 +0530
+
+kubeos-dashboard (0.1.0-10) trixie; urgency=medium
+
+  * Carries a marker line in console.py so the redeploy-on-upgrade behaviour can be verified by
+    CONTENT, not only by a timestamp: after `apt upgrade kubeos-dashboard` the deployed
+    /usr/lib/kubeos-console/console.py must contain it without anyone stopping or starting the
+    install unit by hand.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 20:40:00 +0530
+
+kubeos-dashboard (0.1.0-9) trixie; urgency=medium
+
+  * Actually ship the 0.1.0-8 postinst. It never reached the package: the build sync copied a
+    named list of files (changelog, the two python services, the release tarball) and
+    debian/postinst was not on it, so 0.1.0-8 installed without it and the upgrade still did
+    not redeploy the release. The sync now copies the whole debian/ directory, and the package
+    was checked for the script before publishing this time.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 20:45:00 +0530
+
+kubeos-dashboard (0.1.0-8) trixie; urgency=medium
+
+  * Deploy the release on upgrade. The package ships a tarball, and unpacking it is done by
+    kubeos-dashboard-install.service (kubeos-cli) - Type=oneshot with RemainAfterExit=yes, so
+    that unit answers "active (exited)" for ever and a bare `systemctl start` is a no-op.
+    Measured 2026-11-20: `apt upgrade kubeos-dashboard` moved the package from 0.1.0-6 to
+    0.1.0-7 while the RUNNING console kept the old code, so the fix inside it did nothing until
+    the unit was stopped, reset-failed and started by hand. postinst now does exactly that
+    (warn-only if it cannot), so an upgrade takes effect immediately.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 20:35:00 +0530
+
+kubeos-dashboard (0.1.0-7) trixie; urgency=medium
+
+  * Deleting an etcd snapshot from the dashboard now works in a browser. The page issues the
+    delete as HTTP DELETE, but the console's CORS preflight advertised only
+    "POST, PUT, GET, OPTIONS" - so the browser refused to send the request and the page showed
+    "Failed to fetch", with nothing reaching the service at all (measured 2026-11-20: the
+    console journal had no DELETE from the browser, while the same call from curl - which
+    ignores CORS - deleted the file perfectly). DELETE is now in the advertised list.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 20:25:00 +0530
+
 kubeos-dashboard (0.1.0-6) trixie; urgency=medium
 
   * Stop printing a traceback every time a browser leaves. Neither `authproxy.py` nor

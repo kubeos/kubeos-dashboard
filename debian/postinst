@@ -1,0 +1,31 @@
+#!/bin/sh
+# KubeOS dashboard, postinst: deploy the release that just landed.
+#
+# WHY   This package ships the release TARBALL. Unpacking it into /usr/lib/kubeos-console,
+#       /usr/share/kubeos/dashboard and the systemd units is the job of
+#       kubeos-dashboard-install.service (from kubeos-cli). That unit is Type=oneshot with
+#       RemainAfterExit=yes, so it reports "active (exited)" for ever after the first run and a
+#       bare `systemctl start` does NOTHING. Measured 2026-11-20: after `apt upgrade
+#       kubeos-dashboard` 0.1.0-6 -> 0.1.0-7 the node kept running the previous release until
+#       the unit was stopped, reset-failed and started again - a node that upgrades and silently
+#       keeps old code is worse than one that never upgraded.
+# SAFE  It only re-runs the installer the node already runs at boot, and it is skipped where
+#       systemd is not running (the live-build chroot). A failure is a warning, never a failed
+#       upgrade: the previous release keeps working and the unit runs again at the next boot.
+set -e
+
+# debhelper inserts its generated snippets here; it must sit before this script's own exits.
+#DEBHELPER#
+
+case "${1:-}" in
+    configure) : ;;
+    *) exit 0 ;;
+esac
+
+if [ -d /run/systemd/system ] && systemctl cat kubeos-dashboard-install.service >/dev/null 2>&1; then
+    systemctl stop kubeos-dashboard-install.service >/dev/null 2>&1 || true
+    systemctl reset-failed kubeos-dashboard-install.service >/dev/null 2>&1 || true
+    systemctl start kubeos-dashboard-install.service >/dev/null 2>&1 ||
+        printf 'kubeos-dashboard: WARNING: could not redeploy the release; the previous one keeps running until the next boot\n' >&2
+fi
+exit 0

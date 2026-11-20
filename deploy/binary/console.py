@@ -42,6 +42,8 @@ cluster-admin and it has no login either.
 SAFE: the token is compared in constant time, the handshake is size-limited, a shell is
 fenced by its own process group, and the service is restarted by systemd if it dies.
 """
+# KubeOS deploy marker: 2026-11-20T22:05Z - a redeploy of the release carries this line, so
+# "apt upgrade kubeos-dashboard" can be proven by CONTENT and not only by a timestamp.
 from __future__ import annotations
 
 import argparse
@@ -495,7 +497,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802 - CORS preflight
         self.send_response(204)
         self._cors()
-        self.send_header("Access-Control-Allow-Methods", "POST, PUT, GET, OPTIONS")
+        # DELETE belongs in this list: the dashboard deletes an etcd snapshot with method
+        # DELETE, and a browser refuses to send a method the preflight did not advertise -
+        # which is exactly what "Failed to fetch" meant on the Snapshots page (measured
+        # 2026-11-20: the request never reached this service, the journal showed no DELETE
+        # at all, while curl - which ignores CORS - deleted the file fine).
+        self.send_header("Access-Control-Allow-Methods", "POST, PUT, GET, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
