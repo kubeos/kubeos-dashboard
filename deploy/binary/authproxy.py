@@ -75,6 +75,26 @@ def log(message: str) -> None:
     print(f"kubeos-auth: {message}", flush=True)
 
 
+class QuietServer(ThreadingHTTPServer):
+    """A threading server that does not print a traceback when a client simply goes away.
+
+    WHY: `BaseServer.handle_error` prints a full traceback for every exception that escapes a
+    request, and a client hanging up mid-response is not an error - it is a closed tab, a
+    refresh during a page load, or a probe that gave up. Measured 2026-11-20 on the busiest
+    node: 12 tracebacks in one journal, every one a `BrokenPipeError` raised inside
+    `socketserver.write`, each of them making a healthy gateway look like it was crashing.
+    Anything that is NOT a disconnect keeps the traceback it deserves.
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                            TimeoutError)):
+            log(f"{client_address[0]} went away mid-response ({type(exc).__name__})")
+            return
+        super().handle_error(request, client_address)
+
+
 # Headlamp keeps its own TLS on loopback (`--tls-cert-path` in /etc/default/kubeos-dashboard),
 # so the gateway has to speak TLS upstream too. The certificate is this node's self-signed
 # one and the hop never leaves loopback, so it is not verified here on purpose - verifying it
@@ -1839,7 +1859,7 @@ def main() -> int:
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(args.tls_cert, args.tls_key)
 
-    server = ThreadingHTTPServer((args.listen, args.port), Gateway)
+    server = QuietServer((args.listen, args.port), Gateway)
     server.daemon_threads = True
     server.socket = context.wrap_socket(server.socket, server_side=True)
     log(f"listening on https://{args.listen}:{args.port}/ -> 127.0.0.1:{args.upstream_port} "
