@@ -76,6 +76,25 @@ def log(message: str) -> None:
     print(f"kubeos-console: {message}", flush=True)
 
 
+class QuietServer(ThreadingHTTPServer):
+    """A threading server that does not print a traceback when a client simply goes away.
+
+    WHY: `BaseServer.handle_error` prints a full traceback for every exception that escapes a
+    request, and a client hanging up mid-response is not an error - it is a closed terminal, a
+    page that was reloaded while it was still loading, or a probe that gave up. Measured
+    2026-11-20 on the busiest node: 12 such tracebacks, every one raised inside
+    `socketserver.write`. Anything that is NOT a disconnect keeps the traceback it deserves.
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                            TimeoutError)):
+            log(f"{client_address[0]} went away mid-response ({type(exc).__name__})")
+            return
+        super().handle_error(request, client_address)
+
+
 def read_token(path: str) -> str:
     with open(path, "r", encoding="utf-8") as handle:
         token = handle.read().strip()
@@ -1126,7 +1145,7 @@ def main() -> int:
     Handler.token = read_token(args.token_file)
     Handler.shell = args.shell
     Handler.systemctl = args.systemctl
-    httpd = ThreadingHTTPServer((args.listen, args.port), Handler)
+    httpd = QuietServer((args.listen, args.port), Handler)
     httpd.daemon_threads = True
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(args.tls_cert, args.tls_key)

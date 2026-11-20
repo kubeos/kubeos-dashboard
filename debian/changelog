@@ -1,3 +1,19 @@
+kubeos-dashboard (0.1.0-6) trixie; urgency=medium
+
+  * Stop printing a traceback every time a browser leaves. Neither `authproxy.py` nor
+    `console.py` overrode `BaseServer.handle_error`, and that default prints a full stack for
+    ANY exception that escapes a request - including the entirely normal `BrokenPipeError`
+    from a closed tab, a reload mid-page, or a probe that gave up. Measured 2026-11-20 on the
+    busiest node: 12 tracebacks in one journal, every one raised inside `socketserver.write`,
+    each of them making a healthy gateway look like it was crashing. Both services now answer
+    such a disconnect with one journal line ("went away mid-response") and keep the traceback
+    for anything that is genuinely broken.
+  * The vendored release was rebuilt from this tree and compared file by file against the one
+    that shipped in 0.1.0-5: every file is byte-identical except `authproxy.py` and
+    `console/console.py` (plus the generated `VERSION` build-date and `sha256sums.txt`).
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 07:58:00 +0530
+
 kubeos-dashboard (0.1.0-5) trixie; urgency=medium
 
   * Ship the release archive itself instead of rebuilding it. The package carries the exact

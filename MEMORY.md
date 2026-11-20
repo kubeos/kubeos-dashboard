@@ -2197,3 +2197,31 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   `kubeos-dashboard 0.1.0-5` builds and lintian reports 0 E: tags, and `git diff origin/dev..main` is packaging + CI
   only (12 files). Also dropped `debian/kubeos-dashboard.debhelper.log`, a build log that had been committed.
   Working rule now: develop on `dev`, release by merging `dev` into `main`; the package is built from what `main` holds.
+
+- 2026-11-20 07:40 — dashboard behaviour on the re-imaged cluster, measured: login on the new ISO works end to end
+  (`POST /kubeos-login` with `user`/`password` -> 303 + session cookie; root's yescrypt `$y$` hash verifies through
+  libcrypt via ctypes, which is what replaced the `crypt` module Python 3.13 no longer ships). My earlier "401" was a
+  probe that posted to `/login` — that path sits behind the session gate, so it answers 401 by design; the form action is
+  `/kubeos-login`. The detached-node page works, but a login that lands while `kubeos-node-standalone` finishes is cut off
+  by the handover restarting the gateway (connection refused mid-page) — documented transient, not a defect.
+  One defect found in both `deploy/binary/authproxy.py` and `console.py`: neither server overrides `handle_error`, so
+  every client that hangs up mid-response prints a full traceback (`BrokenPipeError` raised inside `socketserver.write`);
+  12 such tracebacks accumulated on the busy node. Fix is ~8 lines per file (log one line for BrokenPipe/ConnectionReset,
+  keep the traceback for anything else) — not applied, waiting for the user's go-ahead.
+
+- 2026-11-20 08:05 — **the traceback-per-closed-tab defect is fixed and shipped as 0.1.0-6.**
+  `deploy/binary/authproxy.py` and `deploy/binary/console.py` now define
+  `QuietServer(ThreadingHTTPServer)` overriding `handle_error`: `BrokenPipeError`,
+  `ConnectionResetError`, `ConnectionAbortedError` and `TimeoutError` log one line
+  ("<ip> went away mid-response (<Type>)"), everything else keeps its full traceback. A unit-level
+  test raised both kinds into `handle_error` (1 line, no traceback) and a `ValueError` (traceback
+  preserved, as it should be). Live on kubeos1: four requests aborted with `SO_LINGER 0` produced
+  four such lines and **zero new tracebacks**. Release flow used: `deploy/binary/build-binary.sh`
+  (tarball `6d0b797b…`, 836 files), copy into `vendor/release/`, `sha256sum` with the BARE filename
+  (the package verifies after `cd`, so a path-prefixed line breaks it), changelog 0.1.0-6, build on
+  the builder with `dpkg-buildpackage -b`, publish with `archive-publish.sh`. Before shipping I
+  compared the new tarball file by file against the 0.1.0-5 one: only `authproxy.py`,
+  `console/console.py`, `VERSION`'s build-date and `sha256sums.txt` differ — proof that rebuilding
+  from `dev` did not silently drop anything, which is the mistake that cost us the rebalance
+  feature on 2026-11-19. Nothing pushed to GitHub; the working branch is still `dev` (`c79e7cb`
+  plus these changes) and `main` does not carry them yet.
