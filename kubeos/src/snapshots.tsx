@@ -57,13 +57,11 @@ function KubeosSnapshotsPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [token, setToken] = React.useState('');
-  const [port, setPort] = React.useState(30444);
 
   const load = React.useCallback(async () => {
     try {
       const config = await consoleConfig();
       setToken(config.token);
-      setPort(config.port);
       const answer = await consoleFetch(config, '/etcd/snapshots');
       const body = await consoleJson<any>(answer);
       if (body?.ok === false) {
@@ -186,7 +184,7 @@ function KubeosSnapshotsPage() {
                 <Box component="td" sx={{ py: 0.6, pr: 2, fontSize: '0.82rem' }}>{human(entry.bytes)}</Box>
                 <Box component="td" sx={{ py: 0.6, textAlign: 'right', whiteSpace: 'nowrap' }}>
                   <Button size="small"
-                    href={consoleUrl(`/etcd/snapshot?name=${encodeURIComponent(entry.name)}&token=${encodeURIComponent(token)}`, port)}
+                    href={consoleUrl(`/etcd/snapshot?name=${encodeURIComponent(entry.name)}&token=${encodeURIComponent(token)}`)}
                     target="_blank" rel="noopener">
                     Download
                   </Button>

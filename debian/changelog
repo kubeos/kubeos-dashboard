@@ -1,3 +1,36 @@
+kubeos-dashboard (0.1.0-13) trixie; urgency=medium
+
+  * The console hop now presents the console's own Origin. console.py accepts a handshake or an
+    action only when the hostname in Origin equals the hostname in Host, and 0.1.0-12 forwarded
+    the browser's origin (https://<node>:30443) while sending Host: 127.0.0.1:30444 - so every
+    Shell click through the gateway was answered 403 "bad origin" and the page said "the host
+    console closed this session" (measured in Firefox 2026-11-21). The origin the console expects
+    is now set on this internal hop; its check is unchanged for anything talking to it directly.
+    Why 0.1.0-12's own test passed: the test client sent no Origin header at all, which is why a
+    real browser was needed to find this.
+
+ -- KubeOS <mail@kubeos.in>  Sat, 21 Nov 2026 23:25:00 +0530
+
+kubeos-dashboard (0.1.0-12) trixie; urgency=medium
+
+  * The browser no longer talks to the node console's own port. A browser treats every port as a
+    separate site, so reaching the console on :30444 meant a SECOND certificate exception, and
+    until somebody accepted it the Shell button failed with "could not reach the node console on
+    port 30444" - a step no user can be expected to know about. The gateway that already serves
+    :30443 now proxies /console-api/* to the console internally, so the whole product has one
+    origin and one certificate.
+  * Configured, not hardcoded: KUBEOS_CONSOLE_URL (default https://127.0.0.1:30444),
+    KUBEOS_CONSOLE_CA (default /etc/kubeos-dashboard/ca.crt) and KUBEOS_CONSOLE_TLS_VERIFY
+    (default 1). The internal hop still VERIFIES the console's certificate against the cluster CA
+    - only the name check is relaxed, because the hop dials 127.0.0.1 while the leaf carries the
+    node's address. Verification is not switched off anywhere else.
+  * The terminal WebSocket, restart/power-off and the snapshot download all use the same origin;
+    the console token travels either as an Authorization header or as ?token= (a browser cannot
+    set headers on a WebSocket) and is passed through untouched - access logs keep the path and
+    drop the query, so a token never reaches the journal.
+
+ -- KubeOS <mail@kubeos.in>  Sat, 21 Nov 2026 23:05:00 +0530
+
 kubeos-dashboard (0.1.0-11) trixie; urgency=medium
 
   * Silence one real lintian error honestly instead of renaming a date. 0.1.0-9 and 0.1.0-10 were

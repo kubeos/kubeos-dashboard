@@ -1669,6 +1669,158 @@ class Gateway(BaseHTTPRequestHandler):
             self._tunnel(upstream)
         upstream.close()
 
+    # -- the node console, same-origin --------------------------------------------
+    # WHY THIS EXISTS: the browser used to call the console directly on its own port, so it had
+    # to accept a SECOND certificate exception (browsers treat each port as a separate site) and
+    # a fetch failed silently until somebody opened that URL by hand. One origin means one
+    # exception - the dashboard's - and the console becomes an internal hop this gateway makes.
+    CONSOLE_PREFIX = "/console-api"
+
+    def _console_target(self):
+        """Where kubeos-console.service lives, and how to trust its certificate.
+
+        CONFIGURED, NOT HARDCODED: KUBEOS_CONSOLE_URL (default https://127.0.0.1:30444),
+        KUBEOS_CONSOLE_CA (default /etc/kubeos-dashboard/ca.crt) and
+        KUBEOS_CONSOLE_TLS_VERIFY (default 1).
+
+        THE CERTIFICATE IS STILL VERIFIED: the console presents a leaf signed by the cluster CA,
+        which is the file this gateway already has. Only the NAME check is relaxed, because the
+        hop dials 127.0.0.1 while the certificate carries the node's own address - that is not
+        the same thing as switching verification off, and verification stays on everywhere else.
+        """
+        url = os.environ.get("KUBEOS_CONSOLE_URL", "https://127.0.0.1:30444")
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 30444
+        verify = os.environ.get("KUBEOS_CONSOLE_TLS_VERIFY", "1").strip().lower() not in (
+            "0", "false", "no")
+        ca = os.environ.get("KUBEOS_CONSOLE_CA", "/etc/kubeos-dashboard/ca.crt")
+        if not verify:
+            context = ssl._create_unverified_context()
+        else:
+            context = ssl.create_default_context(cafile=ca if os.path.exists(ca) else None)
+            context.check_hostname = False
+        return host, port, context
+
+    def _console_proxy(self) -> None:
+        parsed = urlparse(self.path)
+        rest = parsed.path[len(self.CONSOLE_PREFIX):] or "/"
+        target = rest + (("?" + parsed.query) if parsed.query else "")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, b"bad Content-Length\n", content_type="text/plain; charset=utf-8")
+            return
+        if length > MAX_BODY:
+            self._send(413, b"request body too large\n",
+                       content_type="text/plain; charset=utf-8")
+            return
+        body = self.rfile.read(length) if length > 0 else None
+        host, port, context = self._console_target()
+        # Pass-through on purpose: the page already holds the console token (it reads the
+        # cluster Secret), so the authorization header travels untouched and this gateway never
+        # has to store or log a credential. Access logs record the path WITHOUT the query, so a
+        # token passed as ?token= (the WebSocket needs that form) never lands in the journal.
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_SUPPLIED}
+        headers["Host"] = f"{host}:{port}"
+        headers["X-Forwarded-For"] = self.client_address[0]
+        headers["X-Forwarded-Proto"] = "https"
+        # The console accepts a handshake or an action only from its OWN origin: it compares the
+        # hostname in Origin with the hostname in Host (console.py, "bad origin"). The browser's
+        # origin is the dashboard now, so this trusted hop presents the console's own origin -
+        # which keeps the console's CSRF check fully intact for anything talking to it directly
+        # (measured 2026-11-21: Firefox got 403 "bad origin" while a client that sent no Origin
+        # header got 101, which is why only a real browser showed this).
+        for key in [k for k in headers if k.lower() == "origin"]:
+            headers[key] = f"https://{host}:{port}"
+
+        if self._is_websocket():
+            self._console_websocket(host, port, context, target, headers)
+            return
+
+        connection = http.client.HTTPSConnection(host, port, timeout=600, context=context)
+        try:
+            connection.request(self.command, target, body=body, headers=headers)
+            response = connection.getresponse()
+        except OSError as reason:
+            connection.close()
+            self._send(502, f"the node console is not answering ({reason})\n".encode(),
+                       content_type="text/plain; charset=utf-8")
+            return
+        self.send_response(response.status, response.reason)
+        length_header = None
+        for key, value in response.getheaders():
+            lower = key.lower()
+            if lower in HOP_BY_HOP and lower != "content-length":
+                continue
+            if lower == "content-length":
+                length_header = value
+                continue
+            self.send_header(key, value)
+        if length_header is not None:
+            self.send_header("Content-Length", length_header)
+        elif self.command != "HEAD":
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            if self.command == "HEAD":
+                self.wfile.flush()
+            else:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    if length_header is None:
+                        self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                    else:
+                        self.wfile.write(chunk)
+                    self.wfile.flush()
+                if length_header is None:
+                    self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+    def _console_websocket(self, host, port, context, target, headers) -> None:
+        """The terminal. A browser cannot set headers on a WebSocket, so the token is normally
+        in the query string; either way it is forwarded untouched and never logged."""
+        try:
+            upstream = context.wrap_socket(socket.create_connection((host, port), timeout=30),
+                                           server_hostname=host)
+        except OSError as reason:
+            self._send(502, f"the node console is not answering ({reason})\n".encode(),
+                       content_type="text/plain; charset=utf-8")
+            return
+        lines = [f"{self.command} {target} HTTP/1.1"]
+        for key, value in headers.items():
+            if key.lower() in ("host", "proxy-connection"):
+                continue
+            lines.append(f"{key}: {value}")
+        lines.append(f"Host: {host}:{port}")
+        upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+
+        head = b""
+        while b"\r\n\r\n" not in head:
+            piece = upstream.recv(4096)
+            if not piece:
+                upstream.close()
+                self._send(502, b"the console closed the websocket during the handshake\n",
+                           content_type="text/plain; charset=utf-8")
+                return
+            head += piece
+        header, rest = head.split(b"\r\n\r\n", 1)
+        self.wfile.write(header + b"\r\n\r\n")
+        if rest:
+            self.wfile.write(rest)
+        self.wfile.flush()
+        self.close_connection = True
+        if b" 101 " in header.split(b"\r\n", 1)[0]:
+            self._tunnel(upstream)
+        upstream.close()
+
     # -- routing -----------------------------------------------------------------
     def _dispatch(self) -> None:
         path = urlparse(self.path).path
@@ -1706,6 +1858,13 @@ class Gateway(BaseHTTPRequestHandler):
                 self._send(401, b'{"error":"not signed in"}\n',
                            content_type="application/json; charset=utf-8")
             return
+
+        if path == "/console-api" or path.startswith("/console-api/"):
+            # Same-origin console (2026-11-21): one certificate for the whole product. Behind the
+            # login gate, because every console route is a root action on this node.
+            self._console_proxy()
+            return
+
 
         if path == "/kubeos-node-health":
             state, detail = self.membership.snapshot()

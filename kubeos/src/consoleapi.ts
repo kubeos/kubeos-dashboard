@@ -16,7 +16,7 @@ import { ApiProxy } from "@kinvolk/headlamp-plugin/lib";
 
 const NAMESPACE = "kubeos-system";
 const CONSOLE_SECRET = "kubeos-console-token";
-/** Default port of kubeos-console.service; the Secret may override it. */
+/** Default port of kubeos-console.service; the gateway uses it, the browser never does. */
 const CONSOLE_PORT = 30444;
 
 export type ConsoleConfig = { token: string; port: number };
@@ -51,18 +51,20 @@ export async function consoleConfig(): Promise<ConsoleConfig> {
 }
 
 /**
- * The URL of a console path on this node.
+ * The URL of a console path, on the dashboard's OWN origin.
  *
- * `window.location.hostname` rather than a fixed name: the dashboard may be reached by IP or
- * by DNS, and the certificate carries whichever the installer put in it.
+ * WHY IT IS RELATIVE (2026-11-21): the console used to be reached on its own port, and a browser
+ * treats every port as a separate site - so the user had to accept a second certificate
+ * exception, and until they did, a fetch failed silently. The gateway proxies `/console-api/*`
+ * to the console internally, so the browser only ever sees ONE origin and ONE certificate.
  */
-export function consoleUrl(path: string, port: number): string {
-  return `https://${window.location.hostname}:${port}${path}`;
+export function consoleUrl(path: string): string {
+  return `/console-api${path}`;
 }
 
-/** The one-line explanation a browser needs when a console call fails on the certificate. */
-export function certificateHint(port: number): string {
-  return `If this browser has never opened https://${window.location.hostname}:${port}/ , do that once, accept the certificate warning, then try again.`;
+/** The one-line explanation a console call needs when it fails. */
+export function certificateHint(): string {
+  return 'The console is reached through this dashboard, so there is no second certificate to accept: reload the page, and if it still fails run "systemctl status kubeos-console" on the node.';
 }
 
 /**
@@ -76,13 +78,13 @@ export async function consoleFetch(
 ): Promise<Response> {
   let response: Response;
   try {
-    response = await fetch(consoleUrl(path, config.port), {
+    response = await fetch(consoleUrl(path), {
       ...init,
       headers: { ...(init.headers ?? {}), Authorization: `Bearer ${config.token}` },
     });
   } catch (reason: any) {
     throw new Error(
-      `could not reach the node console on port ${config.port}. ${certificateHint(
+      `could not reach the node console. ${certificateHint(
         config.port
       )} (${String(reason?.message ?? reason)})`
     );

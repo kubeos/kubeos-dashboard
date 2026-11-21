@@ -74,8 +74,6 @@ const NAMESPACE = "kubeos-system";
  */
 const SHELL_POD = "kubeos-node-shell";
 const SHELL_ACTIVITY_ID = "kubeos-node-shell";
-/** Where the node's host console listens (installed by deploy/binary/install.sh). */
-const CONSOLE_PORT = 30444;
 /** The Secret install.sh publishes the console token into. */
 const CONSOLE_SECRET = "kubeos-console-token";
 
@@ -227,7 +225,7 @@ async function requestNodeAction(
     });
   } catch (reason: any) {
     throw new Error(
-      `could not reach the node console on port ${port}. ${certificateHint(port)} (${String(
+      `could not reach the node console. ${certificateHint()} (${String(
         reason?.message ?? reason
       )})`
     );
@@ -265,7 +263,6 @@ function NodeConsole({
   const host = React.useRef<HTMLDivElement | null>(null);
   const [problem, setProblem] = React.useState<string | null>(null);
   const [hint, setHint] = React.useState<string | null>(null);
-  const hostname = window.location.hostname;
 
   React.useEffect(() => {
     let socket: WebSocket | null = null;
@@ -306,7 +303,11 @@ function NodeConsole({
     term.open(host.current);
     fit.fit();
 
-    const url = `wss://${hostname}:${port}/ws?token=${encodeURIComponent(token)}`;
+    // Same origin as this page: the gateway upgrades /console-api/ws and forwards it to the
+    // console internally. A browser cannot set headers on a WebSocket, so the token travels
+    // in the query string, which the gateway passes through and never logs.
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    const url = `${scheme}://${window.location.host}/console-api/ws?token=${encodeURIComponent(token)}`;
     socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
 
