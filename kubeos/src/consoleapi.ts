@@ -84,9 +84,9 @@ export async function consoleFetch(
     });
   } catch (reason: any) {
     throw new Error(
-      `could not reach the node console. ${certificateHint(
-        config.port
-      )} (${String(reason?.message ?? reason)})`
+      `could not reach the node console. ${certificateHint()} (${String(
+        reason?.message ?? reason
+      )})`
     );
   }
   return response;

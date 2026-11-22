@@ -11,12 +11,17 @@ import {
 } from "@kinvolk/headlamp-plugin/lib";
 import { FAVICON, MARK, WORDMARK } from "./assets";
 import { BRAND, PRODUCT_NAME } from "./brand";
+// Disks is imported FIRST of the KubeOS pages: Headlamp appends plugin entries after its own, and the
+// order of these imports is the order they appear. It used to be moved into position with DOM surgery,
+// which broke other groups' child lists (see the note in disks.tsx).
+import "./disks";
 // The "Add node" page: join further machines to this cluster from the dashboard.
 // Imported for its side effect -- it registers its own route and sidebar entry.
 import "./addnode";
-// The "Disks" page: LVM volume groups and thin pools, read from the ConfigMap the
-// node publishes. Imported for its side effect, like addnode above.
-import "./disks";
+// The "Helm" section: the releases on this node and the operations on them (install,
+// upgrade, rollback, uninstall). It runs helm on the host through kubeos-console.service,
+// so no button creates a Pod.
+import "./helm";
 // The "NFS" page: attaches an existing NFS export as a PersistentVolume. It
 // registers itself INSIDE Headlamp's Storage section (sidebar parent 'storage'),
 // because that is where a user looks for storage.

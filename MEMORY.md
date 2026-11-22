@@ -2327,3 +2327,146 @@ Shipped as **0.1.0-14** (release re-vendored, sha256 `e7d62ff6…`), published, 
 192.168.122.5 with `apt`: the deployed `authproxy.py` is byte-identical to this repo (md5
 `a683f7fa…`), the style is served over HTTPS, all three units are active. Branches: `dev` =
 `91defe6`, `main` = `7133eab` (merge).
+
+## 2026-11-22 12:05 — Helm arrives in the dashboard, read-only first (`0.1.0-15`)
+
+The user asked for Helm in the dashboard but did not know what to put in it, and asked for a plan first. The plan has
+three phases; **only Phase 1 is built**, and it is deliberately the one that cannot damage anything:
+
+1. **Read-only visibility — shipped.** A new **Apps** page (`kubeos/src/apps.tsx`, route `/kubeos-apps`, icon
+   `mdi:package-variant-closed`, imported from `kubeos/src/index.tsx`) lists every Helm release on the node — name,
+   namespace, chart, app version, revision, status, last updated — and, for the row you click, the state, the chart's
+   description, the values the user supplied, the revision history, the rendered manifest (capped at 256 KiB) and the
+   chart repositories configured on the node. "No repositories configured" is shown as a normal state, not an error:
+   an offline node has none.
+2. **Lifecycle — next.** Install / upgrade / rollback / uninstall, each with a **dry-run diff shown first** and a
+   **typed confirmation** carrying the release name; uninstall is refused for `kubeos-system` and `kube-system`.
+3. **Supply — after that.** Upload a size-capped `.tgz` from the browser, `helm repo add/remove`, and an image
+   pre-flight that says which images a chart will pull and whether the node can reach them (user's order:
+   upload first, repos later).
+
+**Every Helm call goes through `kubeos-console.service`, never a Pod** (hard rule, user decision 2026-11-12):
+`deploy/binary/console.py` gained `/helm/releases`, `/helm/release` and `/helm/repos` in `do_GET`, read-only, with the
+same token + Origin gate as the LVM and Shell actions (`_action_allowed()`), a 60 s timeout, and the client address
+logged. Release names and namespaces are matched against `^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$` **before** they can
+reach argv, and helm is run with an argv list from a kubeconfig the console already owns.
+
+**helm v4 does not answer like v3, and that changed the implementation:** on `v4.3.0`, `list -A -o json`,
+`history -o json` and `get values -o json` are as expected, but **`status -o json` no longer has a `chart` block** (v3
+did). Its keys are `apply_method, info, manifest, name, namespace, version`, with
+`info.{description,first_deployed,last_deployed,resources,status}`. So the page reads chart and app version from the
+*list* row and the object count from `info.resources`, and it never assumes a `chart` key exists.
+
+Two pre-existing TypeScript errors were fixed on the way, because this page imports the code they live in:
+`certificateHint(config.port)` passed an argument to a function that takes none, and the Shell button's
+`socket.onerror` interpolated `${hostname}` — a name that does not exist — so it threw a ReferenceError exactly when
+the shell had already failed, and the one-origin hint that `0.1.0-13` was written for never appeared. `npm run tsc`
+is clean.
+
+**Verified on 192.168.122.5 with a throwaway ConfigMap-only chart**, then removed: `/helm/releases` returned it,
+`/helm/release` gave `info.status=deployed`, `resources=1`, `values={"greeting":"hello"}`, 1 history entry and a
+121-byte manifest; a missing release → 404, `name=x;rm -rf /tmp` → 400, a bad token → 403, and
+`GET /console-api/helm/releases` **without a session → 401** through the gateway, which proves the route sits behind the
+login gate. `kubectl get pods,jobs -A` was **0** at every step. Release 0.1.0-15 (sha256 `a2913f1b…`), deb built on the
+builder (lintian 0 E:), published to `repo.kubeos.in`, installed with `apt-get install kubeos-dashboard`.
+
+**Watch out in Phase 2:** `_helm` runs with `timeout=60` and the console's `ACTION_WINDOW` busy-lock is 120 s. A helm
+upgrade pulls images and waits for workloads, so it can exceed both — give the mutating verbs their own timeout and
+decide the busy-lock behaviour explicitly instead of inheriting the read-only defaults.
+
+## 2026-11-22 13:00 — the Apps entry was unclickable; fixed in `0.1.0-17` (and how it got verified)
+
+The user opened 0.1.0-15 and said the new **Apps** item *"is like dummy button"* - it was in the sidebar and clicking
+it did nothing. Cause: `registerSidebarEntry({ name, label, icon })` **without `url`**. Headlamp renders an entry that
+claims a `name` nothing else uses but carries no `url` as a **group heading**, so it looks like a page link and is not
+one. Every other KubeOS page passes `url` (`nfs.tsx`, `snapshots.tsx`, `rebalance.tsx`); the only entries that omit it
+are groups whose *children* carry one - `disks.tsx`'s "Disks". Fixed with `parent: null, url: APPS_PATH`, and the built
+bundle shows it directly: `label:"Apps",url:Nt` where `Nt="/kubeos-apps"`.
+
+**The lesson is about verification, not about Headlamp.** The `/helm/*` endpoints had been curled until every status
+code was right (200/400/403/404, tenant isolation of names, no Pods created) and the page could still not be opened.
+A UI page is not verified until it has been clicked. `~/.kubeos-vm/harness/apps-page-check.js` now does exactly that in
+the official harness image: log in at `https://<node>:30443` with the node account, click the sidebar entry, wait for
+the path to change, then read the headings, the table headers, the rows and - after clicking a row - the detail panel
+out of the DOM, with screenshots (`/shots/apps-page.png`, `/shots/apps-detail.png`). Two traps inside the checker
+itself: Headlamp wraps every row in a `<li>`, so clicking the wrapper does nothing and the check "fails" for the wrong
+reason (click the `<a>`), and the route lives under `/c/main/...`, so waiting for `location.pathname.includes(...)`
+is the right signal instead of comparing the whole URL.
+
+**Two more defects only the screenshot could show, fixed in 0.1.0-17:**
+- **"Objects" was always `—`.** helm v4 returns `info.resources` as a **dict keyed `<apiVersion>/<kind>` whose values
+  are lists of objects** (`{"v1/ConfigMap": [{...},{...}], "v1/Service": [{...}]}`); v3 returned a flat list. The page
+  tested `Array.isArray` and fell through to the dash. `resourceCount()` now sums the per-kind lists and still accepts
+  a plain array. Note the trap that hid it: my earlier probe printed `resources: 1` and I read it as "one object",
+  but `len()` of a one-key dict is also 1 - the number agreed with the wrong theory, so only a chart with *several*
+  objects (now the demo: 2 ConfigMaps + 1 Service = **3**) actually discriminates.
+- The title printed twice ("Apps / Apps") because the page drew its own heading inside a `SectionBox`, which already
+  renders one. The subtitle and Refresh button stay.
+
+**State:** `0.1.0-17` published (52 000 320 B) and installed on 192.168.122.5, 3/3 units active, 0 failed, release
+re-vendored (sha256 `a2c0437f…`), archive pruned of 0.1.0-15 and 0.1.0-16 (99.2 MB). A demo release `demo/demo`
+(2 ConfigMaps + 1 ExternalName Service - **no Pod**, the 2026-11-12 rule) is left installed so the page has data to
+look at; remove it when the user is done. Nothing committed or pushed.
+
+## 2026-11-22 13:45 — "Apps" becomes a working "Helm" section (`0.1.0-18`)
+
+The user's verdict on 0.1.0-17 was that seeing information is not enough: *"rename Apps to Helm and add important
+operations to dashboard like what user will do with helm command in terminal.. i just don't want to see only
+information"*, with *"if needed inside helm field tree create another child field to understand"*. So the section is
+now a **sidebar group with two children**, and both pages do work:
+
+| Child | What it does |
+|---|---|
+| **Releases** | the list, the detail panel, and **Upgrade / Rollback / Uninstall** for the selected release |
+| **Install** | chart source (upload or node path), release name, namespace, values YAML → **Preview** → **Install** |
+
+The operations are the CLI ones: `helm install` (Install), `helm upgrade` (Releases → Upgrade, values prefilled from
+the release, chart optional because the node re-uses the uploaded file the release came from), `helm history` (the
+table that feeds the rollback list), `helm rollback` (pick a revision, typed confirm), `helm uninstall` (typed
+confirm, refused for `kubeos-system`/`kubeos-system`-class namespaces on the node), `helm get values` (shown and
+edited as YAML). Code: `kubeos/src/helm.tsx` (replaces `apps.tsx`; the registration, both pages and the three
+dialogs), `deploy/binary/console.py` (`/helm/charts`, `/helm/upload`, `/helm/action`, `describe_chart()`,
+`values_yaml` + `metadata` on `/helm/release`).
+
+**Design decisions that matter later:**
+- **Preview is `--dry-run=client`, never `server`**: client renders the chart without touching the API, so a preview
+  can never create a namespace; `--create-namespace` with a server dry-run has been reported to persist one. The UI
+  disables the apply button until a preview has run *and* the form has not been edited since.
+- **Uploaded charts are the supply path** (the user's "upload first, repos later"): `POST /helm/upload`, raw bytes,
+  64 MiB cap, **filename generated by the node**, `describe_chart()` refuses anything that is not a gzip carrying a
+  `Chart.yaml` at the top two levels, and the newest 20 are kept in `/var/lib/kubeos-console/charts`.
+- **One mutation at a time** (`helm_lock`, non-blocking → 409), previews may overlap; timeouts 180 s preview / 600 s
+  mutation because `_helm`'s old 60 s default is shorter than a real upgrade.
+- Every name, namespace, revision and chart path is validated before it can reach argv, and the whole thing still
+  runs `helm` on the host — **no Pod, Job or exec** (user rule 2026-11-12), proved again by `kubectl get pods,jobs -A`
+  being empty throughout the browser run.
+
+**Two defects of mine that only real clicking found, both fixed in 0.1.0-18:**
+1. a `%`-format bug in the success log line raised *after* helm had run, so the node answered a COMPLETED install
+   with a dropped connection — the page could not tell "done" from "not done", the worst possible ambiguity for a
+   mutating action. The handler now wraps everything after the mutation and answers 500 with "the node ran the Helm
+   command but could not report it", and the format string is fixed.
+2. **MUI closes a Dialog on a backdrop click.** A click a few pixels outside the paper discarded a half-filled
+   upgrade form, and because the detail panel and the dialog both have a button labelled "Upgrade", the closed dialog
+   made the next click a silent no-op. `HelmDialog` now ignores `reason === 'backdropClick'`; Escape still closes.
+
+**Verification** (`~/.kubeos-vm/harness/helm-ops-check.js`, plus `sidebar-probe.js` and `dialog-probe*.js`): sidebar
+group expands to Releases/Install; Install's apply button disabled before preview and enabled after; the preview
+rendered the ConfigMap; `webdemo` installed from an upload; upgraded through the dialog; Uninstall disabled with
+nothing typed and with a wrong name, enabled with the exact name; then removed. Packaged as 0.1.0-18, published,
+`apt`-installed on 192.168.122.5 (3/3 units active), and re-checked in the browser against the packaged bundle.
+Nothing committed or pushed.
+
+## 2026-11-22 14:45 — `0.1.0-20`: the Helm children lost their glyphs, and how the tree reached `dev` + `main`
+
+Two entries of the Helm group ("Releases", "Install") carried their own icons; the user asked for plain text
+there ("remove that small symbols from infront of releases and install.. don't touch another fields"). The whole
+change is the removal of two `icon:` properties in `kubeos/src/helm.tsx`; the group keeps `mdi:package-variant-closed`
+and both pages are untouched. Package `0.1.0-20`, published to `repo.kubeos.in`, installed on 192.168.122.5 with
+`apt` (3/3 units active), release re-vendored (sha256 `522ffc99…`).
+
+**How the Helm work reached git:** everything from 0.1.0-18/19/20 landed in one commit on `dev`, which was then
+merged into `main` and both were pushed - the user's instruction was *"push to kubeos-dashboard dev and main both
+this time only"*. `dev` is the working branch and the one the package is built from; `main` carries the merged
+result so the two cannot disagree about a shipped feature again (the trap from 2026-11-19, when a package was built
+from a stale `main`).
