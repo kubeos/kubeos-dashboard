@@ -2290,3 +2290,40 @@ gateway on the port; A16 a re-install overwrites the kubeconfig.
   will not block 30443, which is worth remembering when testing firewall changes against this product; and the
   console's WebSocket (`wss://<node>:30444`) is unaffected because established traffic and that port are open.
   Verified after the change: dashboard 200, console 200, agent unaffected.
+
+## 2026-11-22 11:35 — the UI is drawn at 70%, matching the signed-off size
+
+The product owner reads the dashboard at **70% browser zoom in a 1366x768 window** (`sizedashboard.png`);
+at 100% the sidebar, the four Overview cards and the Events table are cramped and the whole UI reads
+as too big. The gateway (`deploy/binary/authproxy.py`) now injects into `<head>` of every proxied
+Headlamp page, before first paint:
+
+```css
+html{zoom:0.7}
+html,body,#root,#root>div,.xterm{height:calc(100vh / 0.7)!important}
+```
+
+Why `zoom` and not something else: it is what browser zoom does - it scales the layout **and**
+enlarges the CSS viewport (~1366 px becomes ~1950 px), so MUI's breakpoints pick the wide layout.
+Smaller typography/density would leave the layout believing it has 1366 px, and `transform: scale()`
+would shrink the 1366 px render into a corner with a 30% gap.
+
+**Why the height rule exists** (this cost two wrong attempts): Headlamp's outermost element is
+`Box{sx:{display:"flex",height:"100dvh"}}` - a *viewport unit*, and `zoom` never rescales viewport
+units - so the shell was sized at the window's real height and then drawn at 70%, leaving an empty
+band (`notstreched.png`). Putting the corrective height on `html/body/#root` could not work, because
+that is one level above the sized element; it has to include `#root>div`. The numbers are **inlined**
+(`calc(100vh / var(--x))` can be dropped silently by an engine, and a dropped rule looks exactly like
+"you changed nothing").
+
+Proxied HTML is now `Cache-Control: no-store` - it carries those rules, and a corrected rule was
+invisible while the browser re-used the cached shell.
+
+Overrides: `KUBEOS_UI_ZOOM=1` per node (unscaled); `?zoom=0.68` once per browser (localStorage, and
+it rewrites the height rule so the band does not come back). Browsers without `zoom` (Firefox < 126)
+ignore the rule and show 100%.
+
+Shipped as **0.1.0-14** (release re-vendored, sha256 `e7d62ff6…`), published, and installed on
+192.168.122.5 with `apt`: the deployed `authproxy.py` is byte-identical to this repo (md5
+`a683f7fa…`), the style is served over HTTPS, all three units are active. Branches: `dev` =
+`91defe6`, `main` = `7133eab` (merge).
