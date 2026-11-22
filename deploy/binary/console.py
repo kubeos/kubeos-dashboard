@@ -63,6 +63,8 @@ import ssl
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import termios
 import threading
 import time
@@ -103,6 +105,42 @@ def read_token(path: str) -> str:
     if len(token) < 16:
         raise SystemExit(f"the token in {path} is too short to be a secret")
     return token
+
+
+def describe_chart(path: str) -> tuple:
+    """(name, version, problem) for a chart archive, read WITHOUT trusting its contents.
+
+    WHY THIS EXISTS: the Install page takes a .tgz from a browser, and `helm install <file>` would
+    happily be pointed at anything. This answers "is this really a chart, and which one" before the
+    file is offered to helm, and before its name is shown to a person. It reads only the first
+    Chart.yaml it finds at the top two levels, and never extracts anything to disk.
+    """
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(2) != b"\x1f\x8b":
+                return "", "", "that file is not gzip-compressed (a chart is a .tgz)"
+        with tarfile.open(path, "r:gz") as archive:
+            member = None
+            for candidate in archive.getmembers():
+                if (candidate.isfile() and candidate.name.endswith("Chart.yaml")
+                        and candidate.name.count("/") <= 1):
+                    member = candidate
+                    break
+            if member is None:
+                return "", "", "that archive has no Chart.yaml, so it is not a Helm chart"
+            if member.size > 64 * 1024:
+                return "", "", "that Chart.yaml is implausibly large for a chart"
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                return "", "", "that archive's Chart.yaml cannot be read"
+            text = extracted.read().decode("utf-8", "replace")
+    except (OSError, tarfile.TarError) as reason:
+        return "", "", "that archive cannot be read as a chart: %s" % reason
+    name = re.search(r"^name:\s*[\"']?([A-Za-z0-9._-]+)", text, re.MULTILINE)
+    version = re.search(r"^version:\s*[\"']?([A-Za-z0-9._+-]+)", text, re.MULTILINE)
+    if name is None or version is None:
+        return "", "", "that Chart.yaml has no name or no version, so helm would refuse it"
+    return name.group(1), version.group(1), ""
 
 
 # ---- WebSocket framing ----------------------------------------------------
@@ -590,6 +628,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/action/lvm":
             self._lvm_post()
             return
+        if path == "/helm/upload":
+            self._helm_upload_post()
+            return
+        if path == "/helm/action":
+            self._helm_action_post()
+            return
         if not path.startswith("/action/"):
             self.send_error(404)
             return
@@ -816,6 +860,446 @@ class Handler(BaseHTTPRequestHandler):
                           if entry.endswith(".db") and self.SNAPSHOT_NAME_RE.match(entry))
         except OSError:
             return []
+
+    # --- Helm, read only (2026-11-22) --------------------------------------------------
+    # Until now Helm existed only in a terminal: `helm` is installed on the node (v4.3.0) but a
+    # node had no way to answer "what is deployed here, and with which values?" without SSH.
+    #
+    # NOT A POD, NOT A JOB, NOT AN EXEC (user decision 2026-11-12): this runs `helm` on the host
+    # with an argument list, exactly like the LVM actions above, and this release only READS.
+    # Install/upgrade/rollback/uninstall are a separate change with their own guards - a page that
+    # can only look must never be able to change a cluster.
+    HELM = "/usr/bin/helm"
+    ADMIN_KUBECONFIG = "/etc/kubernetes/admin.conf"
+    HELM_MANIFEST_LIMIT = 256 * 1024
+    # Release names and namespaces are DNS labels; anything else is refused before it reaches argv.
+    HELM_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+
+    # --- Helm operations (2026-11-22, phase 2) ------------------------------------------
+    # The user's words: "i just don't want to see only information.. i want user should do some
+    # basic operations from dashboard" - the five things they would otherwise type: install,
+    # upgrade, rollback, uninstall, and a preview before any of them.
+    #
+    # STILL NOT A POD (user decision 2026-11-12): every operation runs `helm` on the host with an
+    # argument list. Nothing is created in the cluster to run it, and nothing is left behind if it
+    # fails.
+    #
+    # THE PREVIEW IS ALWAYS `--dry-run=client`, never `server`: client mode renders the chart
+    # without contacting the API at all, so a preview can never create a namespace or a release
+    # even where helm's own `--create-namespace --dry-run=server` combination has been reported to
+    # persist one. The real operation then runs without --dry-run.
+    HELM_CHART_DIR = "/var/lib/kubeos-console/charts"
+    HELM_UPLOAD_LIMIT = 64 * 1024 * 1024
+    HELM_VALUES_LIMIT = 256 * 1024
+    HELM_BODY_LIMIT = 512 * 1024
+    HELM_PREVIEW_TIMEOUT = 180
+    HELM_MUTATE_TIMEOUT = 600
+    HELM_KEEP_CHARTS = 20
+    # A release in one of these namespaces is the cluster's own control plane or this node's
+    # dashboard and console: a web page must never be able to remove it (user decision
+    # 2026-11-22, "guard kubeos-system/kube-system + typed confirm").
+    HELM_PROTECTED_NAMESPACES = ("kubeos-system", "kube-system")
+    helm_lock = threading.Lock()
+
+    def _helm_error(self, code: int, message: str) -> None:
+        self._json(code, {"ok": False, "error": message})
+
+    def _helm_kubeconfig(self) -> "str | None":
+        """admin.conf on a control plane; the dashboard's own identity on a worker."""
+        for path in (self.ADMIN_KUBECONFIG, self.DASHBOARD_KUBECONFIG):
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _helm(self, args: list, timeout: int = 60) -> tuple:
+        """Run helm with an argument LIST (never a shell string): (ok, stdout, error)."""
+        kubeconfig = self._helm_kubeconfig()
+        if kubeconfig is None:
+            return False, "", "this node has no kubeconfig, so Helm cannot be used here"
+        if not os.access(self.HELM, os.X_OK):
+            return False, "", "helm is not installed on this node"
+        env = {key: value for key, value in os.environ.items() if not key.startswith("HELM_")}
+        env.update({"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "KUBECONFIG": kubeconfig, "HOME": "/root"})
+        try:
+            result = subprocess.run([self.HELM] + list(args), capture_output=True, text=True,
+                                    timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            return False, "", "helm did not answer within %d seconds" % timeout
+        except OSError as reason:
+            return False, "", "could not run helm: %s" % reason
+        if result.returncode != 0:
+            return False, result.stdout or "", (result.stderr or result.stdout
+                                                or "helm failed").strip()[-600:]
+        return True, result.stdout, ""
+
+    def _helm_releases_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        ok, out, error = self._helm(["list", "--all-namespaces", "-o", "json"])
+        if not ok:
+            self._json(409, {"ok": False, "error": error})
+            return
+        try:
+            releases = json.loads(out or "[]")
+        except ValueError:
+            self._json(500, {"ok": False, "error": "helm list returned something that is not JSON"})
+            return
+        log("%s listed %d Helm release(s)" % (self.client_address[0], len(releases)))
+        self._json(200, {"ok": True, "helm": True, "releases": releases})
+
+    def _helm_release_get(self, parsed) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        query = parse_qs(parsed.query)
+        name = (query.get("name") or [""])[0]
+        namespace = (query.get("namespace") or [""])[0]
+        if not self.HELM_NAME.match(name) or not self.HELM_NAME.match(namespace):
+            self._json(400, {"ok": False,
+                             "error": "name and namespace must look like Kubernetes names"})
+            return
+        target = ["--namespace", namespace, name]
+        status_ok, status_out, status_err = self._helm(["status"] + target + ["-o", "json"])
+        if not status_ok:
+            self._json(404, {"ok": False, "error": status_err})
+            return
+
+        def as_json(ok: bool, out: str):
+            if not ok:
+                return None
+            try:
+                return json.loads(out or "null")
+            except ValueError:
+                return None
+
+        values_ok, values_out, _ = self._helm(["get", "values"] + target + ["-o", "json"])
+        # The Upgrade dialog edits YAML, not JSON, and handing it the exact text helm itself prints
+        # is one conversion less to get wrong. helm prints "null" when the release has no values.
+        yaml_ok, yaml_out, _ = self._helm(["get", "values"] + target + ["-o", "yaml"])
+        values_yaml = yaml_out if yaml_ok else ""
+        if values_yaml.strip() in ("", "null"):
+            values_yaml = ""
+        metadata_ok, metadata_out, _ = self._helm(["get", "metadata"] + target + ["-o", "json"])
+        history_ok, history_out, _ = self._helm(["history"] + target + ["--max", "20", "-o", "json"])
+        manifest_ok, manifest_out, manifest_err = self._helm(["get", "manifest"] + target)
+        manifest = manifest_out if manifest_ok else ""
+        truncated = len(manifest) > self.HELM_MANIFEST_LIMIT
+        if truncated:
+            manifest = manifest[:self.HELM_MANIFEST_LIMIT]
+        log("%s opened Helm release %s/%s" % (self.client_address[0], namespace, name))
+        self._json(200, {
+            "ok": True,
+            "namespace": namespace,
+            "name": name,
+            "status": as_json(status_ok, status_out),
+            "values": as_json(values_ok, values_out),
+            "values_yaml": values_yaml,
+            "metadata": as_json(metadata_ok, metadata_out),
+            "history": as_json(history_ok, history_out),
+            "manifest": manifest,
+            "manifest_truncated": truncated,
+            "manifest_error": "" if manifest_ok else manifest_err,
+        })
+
+    def _helm_repos_get(self) -> None:
+        if not self._action_allowed():
+            self._json(403, {"ok": False, "error": "bad token"})
+            return
+        ok, out, error = self._helm(["repo", "list", "-o", "json"])
+        repos: list = []
+        if ok:
+            try:
+                repos = json.loads(out or "[]")
+            except ValueError:
+                repos = []
+        # No repository configured is the normal state on an offline node, so it is not an error;
+        # the page says "no repositories, upload a chart instead" rather than showing a failure.
+        self._json(200, {"ok": True, "repos": repos, "error": "" if ok else error})
+
+    # --- Helm operations, phase 2 (2026-11-22) ------------------------------------------
+    def _helm_charts_get(self) -> None:
+        """Charts uploaded through this page, so the Install form can offer them again."""
+        if not self._action_allowed():
+            self._helm_error(403, "bad token")
+            return
+        charts = []
+        try:
+            entries = sorted(os.listdir(self.HELM_CHART_DIR), reverse=True)
+        except OSError:
+            entries = []
+        for entry in entries:
+            path = os.path.join(self.HELM_CHART_DIR, entry)
+            if not entry.endswith(".tgz") or not os.path.isfile(path):
+                continue
+            name, version, problem = describe_chart(path)
+            charts.append({"chart": "upload:" + entry,
+                           "size": os.path.getsize(path),
+                           "uploaded": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                     time.localtime(os.path.getmtime(path))),
+                           "name": name, "version": version,
+                           "problem": problem})
+            if len(charts) >= self.HELM_KEEP_CHARTS:
+                break
+        self._json(200, {"ok": True, "charts": charts, "directory": self.HELM_CHART_DIR})
+
+    def _helm_upload_post(self) -> None:
+        """Store a chart .tgz posted by the browser, and say what is inside it."""
+        if not self._action_allowed():
+            log(f"{self.client_address[0]} refused /helm/upload: bad token or origin")
+            self._helm_error(403, "bad token")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._helm_error(400, "empty upload")
+            return
+        if length > self.HELM_UPLOAD_LIMIT:
+            self._helm_error(413, "that chart is larger than 64 MiB")
+            return
+        try:
+            os.makedirs(self.HELM_CHART_DIR, mode=0o700, exist_ok=True)
+        except OSError as reason:
+            self._helm_error(500, "cannot create %s: %s" % (self.HELM_CHART_DIR, reason))
+            return
+        # The stored name is generated HERE and never taken from the browser: a client-supplied
+        # filename in a directory that is later handed to `helm` is a path problem waiting to
+        # happen, and the original name is not needed to run anything.
+        entry = "chart-%s-%s.tgz" % (time.strftime("%Y%m%d-%H%M%S", time.gmtime()),
+                                     os.urandom(3).hex())
+        path = os.path.join(self.HELM_CHART_DIR, entry)
+        written = 0
+        try:
+            with open(path, "wb") as handle:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+        except OSError as reason:
+            self._remove_quietly(path)
+            self._helm_error(500, "could not store the upload: %s" % reason)
+            return
+        chart_name, chart_version, problem = describe_chart(path)
+        if written != length:
+            self._remove_quietly(path)
+            self._helm_error(400, "the upload stopped after %d of %d bytes" % (written, length))
+            return
+        if problem:
+            self._remove_quietly(path)
+            self._helm_error(400, problem)
+            return
+        self._prune_charts()
+        log("%s uploaded chart %s (%d bytes, %s-%s)" % (self.client_address[0], entry, written,
+                                                        chart_name, chart_version))
+        self._json(201, {"ok": True, "chart": "upload:" + entry, "size": written,
+                         "name": chart_name, "version": chart_version})
+
+    @staticmethod
+    def _remove_quietly(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _prune_charts(self) -> None:
+        """Keep the newest HELM_KEEP_CHARTS uploads; a node is not a chart museum."""
+        try:
+            entries = sorted((os.path.getmtime(os.path.join(self.HELM_CHART_DIR, name)), name)
+                             for name in os.listdir(self.HELM_CHART_DIR)
+                             if name.startswith("chart-") and name.endswith(".tgz"))
+        except OSError:
+            return
+        for _, name in entries[:-self.HELM_KEEP_CHARTS]:
+            self._remove_quietly(os.path.join(self.HELM_CHART_DIR, name))
+
+    def _helm_chart_path(self, request: dict, name: str = "", namespace: str = "") -> tuple:
+        """Resolve the posted `chart` to a real path. ("", reason) means refused."""
+        chart = str(request.get("chart") or "").strip()
+        if chart.startswith("upload:"):
+            entry = chart[len("upload:"):]
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.tgz$", entry):
+                return "", "that is not a chart this node uploaded"
+            path = os.path.join(self.HELM_CHART_DIR, entry)
+            if not os.path.isfile(path):
+                return "", "that uploaded chart is no longer on the node; upload it again"
+            return path, ""
+        if chart:
+            if ".." in chart or not re.match(r"^/[A-Za-z0-9._/-]+$", chart):
+                return "", "give a chart as an uploaded file, or an absolute path on the node"
+            if os.path.isdir(chart):
+                if not os.path.isfile(os.path.join(chart, "Chart.yaml")):
+                    return "", "%s is a directory without a Chart.yaml" % chart
+                return chart, ""
+            if os.path.isfile(chart) and (chart.endswith(".tgz") or chart.endswith(".tar.gz")):
+                return chart, ""
+            return "", "%s is neither a chart directory nor a .tgz file" % chart
+        # No chart given: an UPGRADE can reuse the chart this release was installed from, if it is
+        # still among this node's uploads. Without it helm cannot upgrade at all - it has no
+        # "keep the current chart" flag - so say so instead of failing with helm's own words.
+        if not (name and namespace):
+            return "", "choose a chart: upload one, or give an absolute path on the node"
+        ok, out, _ = self._helm(["get", "metadata", name, "-n", namespace, "-o", "json"])
+        if not ok:
+            return "", "choose a chart: this release has no readable metadata to match one against"
+        try:
+            metadata = json.loads(out or "{}")
+        except ValueError:
+            return "", "choose a chart: this release's metadata is not JSON"
+        wanted = (str(metadata.get("chart") or ""), str(metadata.get("version") or ""))
+        try:
+            candidates = sorted(os.listdir(self.HELM_CHART_DIR), reverse=True)
+        except OSError:
+            candidates = []
+        for entry in candidates:
+            if not entry.endswith(".tgz"):
+                continue
+            found_name, found_version, problem = describe_chart(os.path.join(self.HELM_CHART_DIR,
+                                                                             entry))
+            if not problem and (found_name, found_version) == wanted:
+                log("%s matched release %s/%s to uploaded chart %s"
+                    % (self.client_address[0], namespace, name, entry))
+                return os.path.join(self.HELM_CHART_DIR, entry), ""
+        return "", ("%s/%s was installed from chart %s-%s, and this node no longer has that file: "
+                    "upload it again to change only its values"
+                    % (namespace, name, wanted[0] or "?", wanted[1] or "?"))
+
+    def _helm_values_file(self, request: dict) -> tuple:
+        """Write the posted YAML to a private temp file. ("", "") means 'no -f at all'."""
+        values = request.get("values")
+        if values is None or (isinstance(values, str) and not values.strip()):
+            return "", ""
+        if not isinstance(values, str):
+            return "", "the values must be YAML text"
+        if len(values) > self.HELM_VALUES_LIMIT:
+            return "", "the values are larger than 256 KiB"
+        try:
+            os.makedirs(self.HELM_CHART_DIR, mode=0o700, exist_ok=True)
+            handle, path = tempfile.mkstemp(prefix="values-", suffix=".yaml",
+                                            dir=self.HELM_CHART_DIR)
+            with os.fdopen(handle, "w") as out:
+                out.write(values)
+            os.chmod(path, 0o600)
+        except OSError as reason:
+            return "", "cannot write the values file: %s" % reason
+        return path, ""
+
+    def _helm_action_post(self) -> None:
+        """install / upgrade / rollback / uninstall, each optionally as a preview."""
+        if not self._action_allowed():
+            log(f"{self.client_address[0]} refused /helm/action: bad token or origin")
+            self._helm_error(403, "bad token")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > self.HELM_BODY_LIMIT:
+            self._helm_error(400, "expected a JSON body under 512 KiB")
+            return
+        try:
+            request = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except (ValueError, UnicodeDecodeError):
+            self._helm_error(400, "the body is not JSON")
+            return
+        if not isinstance(request, dict):
+            self._helm_error(400, "the body must be a JSON object")
+            return
+
+        action = str(request.get("action") or "")
+        name = str(request.get("name") or "")
+        namespace = str(request.get("namespace") or "")
+        dry = bool(request.get("dryRun"))
+        if action not in ("install", "upgrade", "rollback", "uninstall"):
+            self._helm_error(400, "unknown Helm action: %s" % (action or "(none)"))
+            return
+        if not self.HELM_NAME.match(name):
+            self._helm_error(400, "the release name must look like a Kubernetes name")
+            return
+        if not self.HELM_NAME.match(namespace):
+            self._helm_error(400, "the namespace must look like a Kubernetes name")
+            return
+        if action == "uninstall" and namespace in self.HELM_PROTECTED_NAMESPACES:
+            self._helm_error(403, ("refusing to uninstall %s/%s from a web page: namespace %s "
+                                   "holds this node's own services (use kubectl on the node)"
+                                   % (namespace, name, namespace)))
+            return
+        # A preview may be repeated freely; anything that changes the cluster runs one at a time,
+        # because two `helm upgrade`s on one release interleave their revisions.
+        if not self.helm_lock.acquire(blocking=(dry)):
+            self._helm_error(409, "another Helm operation is still running on this node")
+            return
+        values_path = ""
+        try:
+            if action == "uninstall":
+                if str(request.get("confirm") or "") != name:
+                    self._helm_error(400, "type the release name (%s) to confirm the uninstall" % name)
+                    return
+                argv = ["uninstall", name, "-n", namespace]
+            elif action == "rollback":
+                revision = request.get("revision")
+                if isinstance(revision, bool) or not isinstance(revision, int) \
+                        or not 1 <= revision <= 10000:
+                    self._helm_error(400, "pick a revision number from the history")
+                    return
+                if str(request.get("confirm") or "") != name:
+                    self._helm_error(400, "type the release name (%s) to confirm the rollback" % name)
+                    return
+                argv = ["rollback", name, str(revision), "-n", namespace]
+            else:
+                chart, problem = self._helm_chart_path(request, name, namespace)
+                if problem:
+                    self._helm_error(400, problem)
+                    return
+                values_path, problem = self._helm_values_file(request)
+                if problem:
+                    self._helm_error(400, problem)
+                    return
+                if action == "install":
+                    argv = ["install", name, chart, "-n", namespace, "--create-namespace"]
+                else:
+                    argv = ["upgrade", name, chart, "-n", namespace]
+                if values_path:
+                    argv += ["-f", values_path]
+            if dry:
+                argv.append("--dry-run=client")
+            timeout = self.HELM_PREVIEW_TIMEOUT if dry else self.HELM_MUTATE_TIMEOUT
+            ok, out, error = self._helm(argv, timeout)
+            if not ok:
+                first = (error or "helm failed").splitlines()[0][:200]
+                log("%s Helm %s %s %s/%s failed: %s" % (self.client_address[0],
+                                                        "preview of" if dry else "", action,
+                                                        namespace, name, first))
+                self._helm_error(409, error or "helm failed")
+                return
+            log("%s Helm %s%s %s/%s (values: %s)" % (self.client_address[0],
+                                                     "preview of " if dry else "", action,
+                                                     namespace, name,
+                                                     "yes" if values_path else "no"))
+            self._json(200, {"ok": True, "action": action, "name": name, "namespace": namespace,
+                             "dryRun": dry,
+                             "output": (out or "")[:self.HELM_MANIFEST_LIMIT]})
+        except Exception as reason:  # noqa: BLE001 - see the comment
+            # Deliberately broad: by the time anything here can fail, `helm` may ALREADY have run.
+            # Dropping the connection (what an unhandled exception does) tells the browser "no
+            # answer" and invites a retry of an operation that has been applied - measured
+            # 2026-11-22, when a bad %-format in the success log did exactly that. Answer instead.
+            log("%s Helm %s %s/%s: answered with an error after running helm: %r"
+                % (self.client_address[0], action, namespace, name, reason))
+            self._json(500, {"ok": False,
+                             "error": ("the node ran the Helm command but could not report it (%s); "
+                                       "reload this page to see the real state before retrying"
+                                       % reason)})
+        finally:
+            if values_path:
+                self._remove_quietly(values_path)
+            self.helm_lock.release()
 
     def _snapshots_get(self) -> None:
         if not self._action_allowed():
@@ -1095,6 +1579,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/etcd/snapshot":
             self._snapshot_download(parse_qs(parsed.query))
+            return
+        # Helm: read-only in this release (see _helm_releases_get for why it is not a Pod).
+        if parsed.path == "/helm/releases":
+            self._helm_releases_get()
+            return
+        if parsed.path == "/helm/release":
+            self._helm_release_get(parsed)
+            return
+        if parsed.path == "/helm/repos":
+            self._helm_repos_get()
+            return
+        if parsed.path == "/helm/charts":
+            self._helm_charts_get()
             return
         if parsed.path != "/ws":
             self.send_error(404)

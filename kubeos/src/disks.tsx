@@ -933,94 +933,21 @@ function LvmThinPage() {
  * Disks simply stays where Headlamp put it (at the end of the list). It re-runs on
  * sidebar mutations, at most once per animation frame.
  */
-const OUR_HREF = /\/kubeos-disks(\/|\?|$)/;
-const STORAGE_HREF = /\/storage(\/|\?|$)/;
-
-/** A top-level sidebar entry: an `<li>` whose first element child is its link. */
-const isEntry = (element: Element) =>
-  element.tagName === 'LI' && element.firstElementChild?.tagName === 'A';
-
-const hrefOfEntry = (element: Element) =>
-  element.firstElementChild?.getAttribute('href') ?? '';
-
-/** A rendered child list: an `<li>` that is not an entry but holds links. */
-const isChildList = (element: Element) => !isEntry(element) && !!element.querySelector('a');
-
-function placeDisksAfterStorage(): void {
-  // Our group row: the top-level entry that links to one of our pages. A group
-  // with no url of its own links to its first child, so child anchors match too —
-  // only the entry wrapper counts.
-  const ourItem = Array.from(document.querySelectorAll('a[href*="/kubeos-disks"]'))
-    .map(anchor => anchor.closest('li'))
-    .find(item => item !== null && isEntry(item) && OUR_HREF.test(hrefOfEntry(item)));
-
-  const list = ourItem?.parentElement;
-  if (!ourItem || !list) {
-    return;
-  }
-
-  const children = Array.from(list.children);
-  const storageItem = children.find(
-    child => isEntry(child) && STORAGE_HREF.test(hrefOfEntry(child))
-  );
-  if (!storageItem || storageItem === ourItem) {
-    return;
-  }
-
-  const childLists = children.filter(isChildList);
-  const ourSubList = childLists.find(child => !!child.querySelector('a[href*="/kubeos-disks"]'));
-
-  // Storage's child list only exists while Storage is the open group; there is at
-  // most one other list, and it is only ours when ours is that one.
-  const storageIsOpen = storageItem.firstElementChild?.classList.contains('Mui-selected');
-  const storageSubList = storageIsOpen
-    ? childLists.find(child => child !== ourSubList)
-    : undefined;
-
-  const block = [storageItem, storageSubList, ourItem, ourSubList].filter(
-    (node): node is Element => !!node
-  );
-  const inPlace = block.every(
-    (node, index) => index === 0 || block[index - 1].nextElementSibling === node
-  );
-  if (inPlace) {
-    return;
-  }
-
-  // Re-seat the four nodes as one unit, in that order, where Storage already is.
-  const parent = storageItem.parentNode;
-  if (!parent) {
-    return;
-  }
-  const marker = document.createComment('kubeos-disks-block');
-  parent.insertBefore(marker, storageItem);
-  const fragment = document.createDocumentFragment();
-  block.forEach(node => fragment.appendChild(node));
-  parent.insertBefore(fragment, marker);
-  marker.parentNode?.removeChild(marker);
-}
-
-function keepDisksAfterStorage(): void {
-  let scheduled = false;
-  const schedule = () => {
-    if (scheduled) {
-      return;
-    }
-    scheduled = true;
-    window.requestAnimationFrame(() => {
-      scheduled = false;
-      placeDisksAfterStorage();
-    });
-  };
-  new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
-  schedule();
-}
+// The Disks group is a plain top-level entry. It used to be MOVED in the DOM to sit right after Storage
+// (Headlamp gives a plugin no ordering API, so the only lever was surgery on the rendered list). That
+// hack is gone as of 2026-11-22, and this is why: Headlamp renders each expanded group's child list as a
+// sibling of the entries and reconciles that list by node identity, so moving a node behind React's back
+// makes React put the NEXT group's child list in the wrong place. Measured: with the Helm group added and
+// open, the sidebar showed "Disks > Releases, Install" and the Helm tree vanished - the user's bug, from
+// my own cosmetic ordering hack. A sidebar that is merely in a different order is a much smaller problem
+// than a page that cannot be reached, so the order now comes from registration alone (disks.tsx is
+// imported first in index.tsx, which puts Disks at the top of the plugin entries).
 
 /* ---- registration -------------------------------------------------------- */
 
-// Proxmox order: a top-level Disks group with exactly two sub-pages. The group
-// has no url of its own, so Headlamp links it to its first child (LVM) and
-// expands the children while either page is open.
+// A top-level Disks group with two sub-pages (Proxmox's order). The group has no url of its own, so
+// Headlamp links it to its first child (LVM) and expands the children while either page is open.
+// `disks.tsx` is imported first in index.tsx so this group appears before the other KubeOS pages.
 registerSidebarEntry({ name: GROUP, label: 'Disks', icon: 'mdi:harddisk' });
 registerSidebarEntry({ parent: GROUP, name: LVM_ENTRY, label: 'LVM', url: LVM_PATH });
 registerSidebarEntry({ parent: GROUP, name: THIN_ENTRY, label: 'LVM-Thin', url: THIN_PATH });
@@ -1040,5 +967,3 @@ registerRoute({
   exact: true,
   component: LvmThinPage,
 });
-
-keepDisksAfterStorage();

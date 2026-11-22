@@ -344,9 +344,13 @@ function NodeConsole({
       }
     };
     socket.onerror = () => {
+      // No hostname/port here: since 2026-11-21 the console is reached through this dashboard on
+      // its own origin, so the old "open https://<node>:30444 once" advice no longer applies - and
+      // the template that used `${hostname}` referred to nothing at all and threw a ReferenceError
+      // exactly when the shell had already failed, which is why the hint never appeared.
       stop(
-        `could not reach the host console on port ${port}`,
-        `If this browser has never opened https://${hostname}:${port}/ , do that once, accept the certificate warning, then press Shell again.`
+        "could not reach the host console",
+        "The console is reached through this dashboard, so there is no second certificate to accept: reload the page, and if it still fails run \"systemctl status kubeos-console\" on the node."
       );
     };
     socket.onclose = () => {
