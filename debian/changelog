@@ -1,3 +1,28 @@
+kubeos-dashboard (0.1.0-14) trixie; urgency=medium
+
+  * The dashboard is drawn at 70%, the size it was signed off at (user, 2026-11-22:
+    sizedashboard.png is the product read in a 1366x768 window at 70% browser zoom). Headlamp lays
+    itself out for a wide viewport, so at 100% in that window the sidebar, the four Overview cards
+    and the Events table are cramped and the whole UI reads as too big.
+    The gateway now injects html{zoom:0.7} into <head> of every proxied Headlamp page, before the
+    first paint. `zoom` is the only lever that reproduces browser zoom: it scales the layout AND
+    enlarges the CSS viewport (~1366 px becomes ~1950 px), so MUI's breakpoints pick the wide
+    layout. Smaller typography/density would leave the layout believing it has 1366 px, and
+    transform: scale() would shrink the 1366 px render into a corner with a 30% gap.
+  * The scaled shell now fills the window. Headlamp's outermost element is
+    Box{sx:{display:"flex",height:"100dvh"}} - a viewport unit, which `zoom` does not rescale - so
+    it was laid out at the window's real height and then drawn at 70%, leaving an empty band under
+    the UI (user: notstreched.png). The shell's height is divided by the factor to compensate.
+    First attempt applied the height to html/body/#root, one level above the sized element, and
+    could not have worked; the rule now targets #root>div as well.
+  * Proxied HTML is served Cache-Control: no-store. It carries the injected rules, so a corrected
+    rule looked like "nothing changed" while the browser re-used the cached shell.
+  * KUBEOS_UI_ZOOM overrides the factor per node (1 = unscaled), and any browser can override it
+    for itself once with ?zoom=0.68 (kept in localStorage), which moves the divided heights too.
+    Browsers without `zoom` (Firefox before 126) ignore the rule and show 100%.
+
+ -- KubeOS <mail@kubeos.in>  Sun, 22 Nov 2026 11:25:00 +0530
+
 kubeos-dashboard (0.1.0-13) trixie; urgency=medium
 
   * The console hop now presents the console's own Origin. console.py accepts a handshake or an

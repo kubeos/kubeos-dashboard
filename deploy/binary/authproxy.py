@@ -757,6 +757,55 @@ REBALANCE_ANNOTATION = "kubeos.io/rebalanced-at"
 # every HTML page it proxies gets this small script: it watches /kubeos-cluster-health, explains
 # the wait in KubeOS's own words, and reloads the page by itself once the API is back.
 WATCH_SNIPPET = b'<script src="/kubeos-watch.js" defer></script>'
+
+# The dashboard's own scale (user, 2026-11-22). Headlamp lays itself out for a wide viewport:
+# in a 1366x768 window at 100% the sidebar, the four Overview cards and the Events table are
+# cramped, which is why the product owner reads the dashboard at 70% browser zoom - the size the
+# design was signed off at (sizedashboard.png).
+#
+# `zoom` is the ONLY lever that reproduces that, because it is what the browser's own zoom does:
+# it scales the layout AND enlarges the CSS viewport (1366 px becomes ~1950 px), so MUI's
+# breakpoints pick the wide layout too. The two obvious alternatives both fail visibly - smaller
+# typography/density leaves the layout believing it has 1366 px (cards stack, sidebar stays
+# narrow), and transform: scale(0.7) shrinks the 1366 px render into the top-left with a 30% gap.
+#
+# KUBEOS_UI_ZOOM overrides it per node (1 restores the unscaled view). A browser can also
+# override it for itself with ?zoom=0.68 once (remembered in localStorage); the injected script
+# does that, and the style below is the default. Browsers without `zoom` (Firefox before 126)
+# ignore it and simply show 100%.
+# Inserted before </head>, unlike the watchdog, so it applies before the first paint - a style
+# applied after boot would show the full-size UI for a frame and then snap.
+UI_ZOOM = os.environ.get("KUBEOS_UI_ZOOM", "0.7").strip()
+UI_ZOOM_SNIPPET = (
+    b'<style id="kubeos-ui-zoom">'
+    b'html{zoom:' + UI_ZOOM.encode() + b'}'
+    # `zoom` scales a box that was already sized; it does NOT change the viewport that `vh`,
+    # `dvh` and percentage heights are resolved against. The app's outermost element is
+    #   Box{sx:{display:"flex", height:"100dvh"}}        (frontend bundle, static/js/index.*.js)
+    # so it was laid out at the window's real height and then drawn at the factor - which is the
+    # empty band under the UI (user, 2026-11-22: notstreched.png). `#root>div` is that Box; the
+    # other selectors cover the chains it inherits from.
+    #
+    # The numbers are INLINED, not written as calc(100vh / var(--kubeos-zoom)): dividing by a
+    # var() inside calc() is exactly the kind of expression an engine may drop, and a dropped rule
+    # is indistinguishable from "you changed nothing" - which cost one wrong round already.
+    # !important because the emotion class and Headlamp's index.css set the same properties on the
+    # same elements and an equal-specificity rule of ours loses to whichever <style> lands later.
+    b'html,body,#root,#root>div,.xterm{height:calc(100vh / ' + UI_ZOOM.encode() + b')!important}'
+    b'</style>'
+    b'<style id="kubeos-ui-zoom-user"></style>'
+    # Per-browser override: ?zoom=0.68 once, remembered in localStorage. It must move the divided
+    # heights with the factor, or the band comes back at the new scale.
+    b'<script>(function(){try{'
+    b'var p=new URLSearchParams(location.search).get("zoom");'
+    b'if(p&&/^[0-9]+(\\.[0-9]+)?$/.test(p)){localStorage.setItem("kubeos-zoom",p);}'
+    b'var z=localStorage.getItem("kubeos-zoom");'
+    b'if(z&&/^[0-9]+(\\.[0-9]+)?$/.test(z)){'
+    b'document.documentElement.style.zoom=z;'
+    b'document.getElementById("kubeos-ui-zoom-user").textContent='
+    b'"html,body,#root,#root>div,.xterm{height:calc(100vh / "+z+")!important}";'
+    b'}}catch(e){}})()</script>'
+) if UI_ZOOM and UI_ZOOM.lower() not in ("1", "1.0", "none", "off") else b""
 WATCH_JS = b"""/* KubeOS dashboard watchdog: says why the screen is empty, and reloads when it is not. */
 (function () {
   var failures = 0;
@@ -1581,6 +1630,13 @@ class Gateway(BaseHTTPRequestHandler):
                 and not self._is_websocket()):
             raw = response.read()
             connection.close()
+            # The UI scale goes into <head> so it is in force before the first paint; the
+            # watchdog goes at </body> because it only has to run once the app exists.
+            if UI_ZOOM_SNIPPET and UI_ZOOM_SNIPPET not in raw:
+                if b"</head>" in raw:
+                    raw = raw.replace(b"</head>", UI_ZOOM_SNIPPET + b"</head>", 1)
+                else:
+                    raw = UI_ZOOM_SNIPPET + raw
             if WATCH_SNIPPET not in raw:
                 if b"</body>" in raw:
                     raw = raw.replace(b"</body>", WATCH_SNIPPET + b"</body>", 1)
@@ -1589,9 +1645,13 @@ class Gateway(BaseHTTPRequestHandler):
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
                 lower = key.lower()
-                if lower in HOP_BY_HOP or lower == "content-length":
+                if lower in HOP_BY_HOP or lower in ("content-length", "cache-control"):
                     continue
                 self.send_header(key, value)
+            # This body carries the injected KubeOS UI rules, so it must never be reused from the
+            # browser cache: on 2026-11-22 a corrected rule looked like "nothing changed" because
+            # the shell HTML came back out of the cache. It is a few KB, so no-store costs nothing.
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
